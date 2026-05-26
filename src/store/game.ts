@@ -686,6 +686,29 @@ let _suppressGmPush = false;
 // while the first push is still in flight (e.g. on a slow connection).
 let _gmAdvanceInFlight = false;
 
+// ─── Push serialization queue (May 2026 — fixes the state-undo bug) ────
+// Pre-fix, pushStateToServer was fire-and-forget. Two rapid user actions
+// in the same tab (open route + adjust slider, click two retrofit chips,
+// the heartbeat firing while the user opens a modal, etc.) both captured
+// the same `serverStateVersion` BEFORE either landed. The first wrote;
+// the second's expectedVersion was now stale → 409 → hard rehydrate →
+// the second mutation was silently undone 1-2 seconds after it was made.
+// From the user's perspective: "nothing I do is sticking."
+//
+// Fix: serialize all real (server-bound) pushes from this tab. Each call
+// appends to a Promise chain and waits for the previous push to settle
+// before starting. Because the snapshot + expectedVersion capture happens
+// INSIDE the queued task, two rapid clicks produce a clean v→v+1→v+2
+// sequence — no version race possible.
+let _pushQueue: Promise<unknown> = Promise.resolve();
+function _enqueuePush<T>(work: () => Promise<T>): Promise<T> {
+  const next = _pushQueue.then(work, work);
+  // Swallow rejections at the chain level so one failed push doesn't
+  // poison the queue for every subsequent push.
+  _pushQueue = next.catch(() => {});
+  return next;
+}
+
 function fmtMoneyPlain(n: number): string {
   if (n >= 1e6) return `$${(n / 1e6).toFixed(1)}M`;
   if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}K`;
@@ -2150,17 +2173,41 @@ export const useGame = create<GameStore>()(
         if (player.cashUsd < spec.ecoUpgradeUsd)
           return { ok: false, error: "Insufficient cash" };
 
+        // PRD May 2026: any structural config grounds the plane for 1 Q.
+        // Eco engine retrofit is bay work — wing/fairing pulls, fuel
+        // system mods — and a real airline takes the airframe off-line
+        // for the duration. Use the same renovationCompleteQuarter
+        // field the auto-restore at quarter close already reads.
+        const wasOnRoute = !!plane.routeId;
         set({
           teams: s.teams.map((t) =>
             t.id !== s.playerTeamId ? t : {
               ...t,
               cashUsd: t.cashUsd - spec.ecoUpgradeUsd,
               fleet: t.fleet.map((f) => f.id === aircraftId
-                ? { ...f, ecoUpgrade: true, ecoUpgradeQuarter: s.currentQuarter, ecoUpgradeCost: spec.ecoUpgradeUsd }
+                ? {
+                    ...f,
+                    ecoUpgrade: true,
+                    ecoUpgradeQuarter: s.currentQuarter,
+                    ecoUpgradeCost: spec.ecoUpgradeUsd,
+                    status: "grounded" as const,
+                    routeId: null,
+                    renovationCompleteQuarter: s.currentQuarter + 1,
+                  }
                 : f),
+              routes: t.routes.map((r) => ({
+                ...r,
+                aircraftIds: r.aircraftIds.filter((id) => id !== aircraftId),
+              })),
             },
           ),
         });
+        toast.info(
+          `${spec.name} grounded for eco retrofit`,
+          wasOnRoute
+            ? `Aircraft pulled from its route · returns next quarter`
+            : `1 quarter downtime · −10% fuel burn on return`,
+        );
         return { ok: true };
       },
 
@@ -2186,20 +2233,36 @@ export const useGame = create<GameStore>()(
         if (player.cashUsd < cost)
           return { ok: false, error: `Need ${fmtMoneyPlain(cost)} cash` };
 
+        // PRD May 2026: structural retrofit grounds the airframe for 1 Q.
+        const wasOnRoute = !!plane.routeId;
         set({
           teams: s.teams.map((t) =>
             t.id !== s.playerTeamId ? t : {
               ...t,
               cashUsd: t.cashUsd - cost,
               fleet: t.fleet.map((f) =>
-                f.id === aircraftId ? { ...f, engineUpgrade: kind } : f,
+                f.id === aircraftId
+                  ? {
+                      ...f,
+                      engineUpgrade: kind,
+                      status: "grounded" as const,
+                      routeId: null,
+                      renovationCompleteQuarter: s.currentQuarter + 1,
+                    }
+                  : f,
               ),
+              routes: t.routes.map((r) => ({
+                ...r,
+                aircraftIds: r.aircraftIds.filter((id) => id !== aircraftId),
+              })),
             },
           ),
         });
-        toast.success(
-          `Engine retrofit installed`,
-          `${AIRCRAFT_BY_ID[plane.specId]?.name} · ${kind} · −${fmtMoneyPlain(cost)}`,
+        toast.info(
+          `${AIRCRAFT_BY_ID[plane.specId]?.name} grounded for engine retrofit`,
+          wasOnRoute
+            ? `Aircraft pulled from its route · ${kind} engine · returns next quarter`
+            : `1 quarter downtime · ${kind} engine · −${fmtMoneyPlain(cost)}`,
         );
         return { ok: true };
       },
@@ -2279,20 +2342,36 @@ export const useGame = create<GameStore>()(
         if (player.cashUsd < cost)
           return { ok: false, error: `Need ${fmtMoneyPlain(cost)} cash` };
 
+        // PRD May 2026: fuselage coating grounds for 1 Q (hangar work).
+        const wasOnRoute = !!plane.routeId;
         set({
           teams: s.teams.map((t) =>
             t.id !== s.playerTeamId ? t : {
               ...t,
               cashUsd: t.cashUsd - cost,
               fleet: t.fleet.map((f) =>
-                f.id === aircraftId ? { ...f, fuselageUpgrade: true } : f,
+                f.id === aircraftId
+                  ? {
+                      ...f,
+                      fuselageUpgrade: true,
+                      status: "grounded" as const,
+                      routeId: null,
+                      renovationCompleteQuarter: s.currentQuarter + 1,
+                    }
+                  : f,
               ),
+              routes: t.routes.map((r) => ({
+                ...r,
+                aircraftIds: r.aircraftIds.filter((id) => id !== aircraftId),
+              })),
             },
           ),
         });
-        toast.success(
-          `Fuselage coating applied`,
-          `${AIRCRAFT_BY_ID[plane.specId]?.name} · −10% fuel burn · −${fmtMoneyPlain(cost)}`,
+        toast.info(
+          `${AIRCRAFT_BY_ID[plane.specId]?.name} grounded for fuselage coating`,
+          wasOnRoute
+            ? `Aircraft pulled from its route · returns next quarter`
+            : `1 quarter downtime · −10% fuel burn on return`,
         );
         return { ok: true };
       },
@@ -2761,8 +2840,15 @@ export const useGame = create<GameStore>()(
               newActivations.push(code);
             }
           }
-          if (setupCost > player.cashUsd)
-            return { ok: false, error: `Cargo storage setup requires $${(setupCost / 1_000_000).toFixed(1)}M` };
+          // CHANGE (May 2026): no hard cash gate on cargo-storage
+          // activation. If the player's cash can't cover the setup,
+          // we still let the route open — the deficit drops cash
+          // negative, and the engine's RCF auto-draw at quarter close
+          // absorbs it at 2× base rate (the "premium" running-cost
+          // category the user described). Opening a route at cash=0
+          // therefore becomes a deliberate leverage decision rather
+          // than a hard block, which lines up with how a real airline
+          // funds incremental ops through its overdraft facility.
         }
 
         set({
@@ -2780,8 +2866,21 @@ export const useGame = create<GameStore>()(
           ),
         });
         if (setupCost > 0) {
-          toast.info("Cargo storage activated",
-            `${newActivations.join(" + ")} · $${(setupCost / 1_000_000).toFixed(1)}M one-time`);
+          // When the setup pushed cash negative, flag it explicitly so
+          // the player knows the deficit will hit the premium-rate
+          // RCF at quarter close instead of silently treating it as
+          // free expansion. We don't move money into the RCF here —
+          // the engine's auto-draw logic owns that transition — but
+          // the toast sets expectation about the interest cost.
+          const pushedNegative = (player.cashUsd - setupCost) < 0;
+          if (pushedNegative) {
+            toast.warning("Cargo storage activated — running on overdraft",
+              `${newActivations.join(" + ")} · $${(setupCost / 1_000_000).toFixed(1)}M. ` +
+              `Cash deficit will draw from your RCF at 2× base rate at quarter close.`);
+          } else {
+            toast.info("Cargo storage activated",
+              `${newActivations.join(" + ")} · $${(setupCost / 1_000_000).toFixed(1)}M one-time`);
+          }
         }
         if (willBePending) {
           toast.warning(
@@ -6723,22 +6822,34 @@ export const useGame = create<GameStore>()(
       },
 
       pushStateToServer: (eventType, eventPayload) => {
+        // Cheap pre-flight checks that should NOT wait on the push queue.
+        // The queue is for real server-bound pushes — these are no-ops
+        // (observer, solo run, not yet bound to a gameId) and should
+        // return immediately so callers don't get blocked behind unrelated
+        // queued work.
+        {
+          const pre = get();
+          if (pre.isObserver) return Promise.resolve({ ok: true as const });
+          if (_suppressGmPush) return Promise.resolve({ ok: true as const });
+          if (!pre.session?.gameId) return Promise.resolve({ ok: true as const });
+          if (!pre.localSessionId) return Promise.resolve({ ok: true as const });
+          if (typeof fetch === "undefined") return Promise.resolve({ ok: true as const });
+        }
+        // Serialize real pushes. The queued task re-reads state at the
+        // time it runs (NOT at enqueue time) so consecutive pushes see
+        // a fresh stateJson + expectedVersion and never race their own
+        // earlier writes. See _enqueuePush comment above for context.
+        return _enqueuePush(async () => {
         const s = get();
-        // Game Master is observer-only — never write state on their behalf.
-        if (s.isObserver) return Promise.resolve({ ok: true as const });
-        // Suppress internal pushes during gmAdvanceQuarter so only one
-        // atomic write goes out after both closeQuarter + advanceToNext
-        // have fully computed the new state.
-        if (_suppressGmPush) return Promise.resolve({ ok: true as const });
+        // Re-check now that we're at the front of the queue — the
+        // store may have flipped to observer / lost its session while
+        // we were waiting (rare, but cheap to guard).
+        if (s.isObserver) return { ok: true as const };
+        if (_suppressGmPush) return { ok: true as const };
         const session = s.session;
-        // Solo runs (no session) and runs that haven't been bound to a
-        // server-side gameId skip the write-back entirely. Returning
-        // here is a no-op — the local engine has already advanced.
-        if (!session?.gameId) return Promise.resolve({ ok: true as const });
-        // Use the authenticated Supabase user.id stored during hydration.
-        // This is always server-side identity — never a browser-only UUID.
+        if (!session?.gameId) return { ok: true as const };
         const sessionId = s.localSessionId;
-        if (!sessionId) return Promise.resolve({ ok: true as const });
+        if (!sessionId) return { ok: true as const };
         const actorTeamId = s.activeTeamId ?? s.playerTeamId ?? undefined;
 
         // Build a partialize-compatible payload mirroring the persist
@@ -6881,15 +6992,50 @@ export const useGame = create<GameStore>()(
                 "game.ended",
                 "game.botRoundAdvanced",
               ]);
-              const shouldHydrateAfter409 = !SILENT_409_EVENTS.has(eventType);
               const humanCount = get().teams.filter(
                 (t) => t.controlledBy === "human",
               ).length;
+              // MAJOR FIX (May 2026 — companion to the push queue):
+              // In single-human games (1 human + N bots) the CAS
+              // conflict can only ever be the player racing their own
+              // previous push. There is no peer cohort to be "out of
+              // sync" with. Hard-rehydrating wipes the player's local
+              // mutation 1-2 seconds after they made it. We now treat
+              // every 409 in solo mode as silent and refetch JUST the
+              // version (not the state) so the next push uses the
+              // right expectedVersion without clobbering the local
+              // mutation that just landed.
+              const isSoloGame = humanCount < 2;
+              const shouldHydrateAfter409 =
+                !isSoloGame && !SILENT_409_EVENTS.has(eventType);
 
               if (shouldHydrateAfter409) {
                 console.warn(
                   `[state-update] stale write — server rejected event ${eventType}. Auto-refetching authoritative state.`,
                 );
+              } else if (isSoloGame) {
+                // Refetch authoritative state but DON'T hydrate it —
+                // just update serverStateVersion so the next push uses
+                // the right expectedVersion. Local mutations are
+                // preserved. With the push queue in place, this path
+                // should almost never fire in solo mode anyway (queue
+                // serialises away the race) — it's a safety net for
+                // edge cases like the server having advanced from a
+                // cron or admin action.
+                try {
+                  const verRes = await fetch(
+                    `/api/games/load?gameId=${encodeURIComponent(gameId)}&includeState=1`,
+                    { cache: "no-store" },
+                  );
+                  if (verRes.ok) {
+                    const verJson = await verRes.json();
+                    if (typeof verJson?.state?.version === "number") {
+                      set({ serverStateVersion: verJson.state.version });
+                    }
+                  }
+                } catch (verErr) {
+                  console.warn("[state-update] solo version refetch failed:", verErr);
+                }
               }
 
               if (shouldHydrateAfter409) {
@@ -6942,6 +7088,7 @@ export const useGame = create<GameStore>()(
             console.warn(`[state-update] network error on event ${eventType}:`, err);
             return { ok: false as const, error: err instanceof Error ? err.message : "Network error" };
           });
+        }); // _enqueuePush close
       },
 
       rebroadcastSessionCode: () => {
