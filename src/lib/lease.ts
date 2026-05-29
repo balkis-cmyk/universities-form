@@ -1,5 +1,5 @@
 import type { AircraftSpec, FleetAircraft, Team } from "@/types/game";
-import { effectiveUnlockQuarter } from "@/lib/engine";
+import { effectiveUnlockQuarter, effectiveCutoffRound } from "@/lib/engine";
 
 /**
  * Lease economics (Option C — user-confirmed).
@@ -97,7 +97,8 @@ export function leaseEligibleSpecIds(
 ): { passenger: Set<string>; cargo: Set<string> } {
   function available(s: AircraftSpec): boolean {
     if (effectiveUnlockQuarter(s, campaignMode) > currentQuarter) return false;
-    if (typeof s.cutoffRound === "number" && currentQuarter > s.cutoffRound) return false;
+    const cutoff = effectiveCutoffRound(s, campaignMode);
+    if (typeof cutoff === "number" && currentQuarter > cutoff) return false;
     return true;
   }
   function stockRank(a: AircraftSpec, b: AircraftSpec): number {

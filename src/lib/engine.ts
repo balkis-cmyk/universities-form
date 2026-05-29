@@ -180,9 +180,15 @@ export function discontinuedMaintenanceMultiplier(
   spec: { cutoffRound?: number } | undefined,
   currentQuarter: number,
   ecoUpgraded: boolean,
+  campaignMode: "half" | "full" = "half",
 ): number {
   if (!spec || typeof spec.cutoffRound !== "number") return 1.0;
-  const roundsSince = currentQuarter - spec.cutoffRound;
+  // Full campaigns (2000 start) run on a +60-quarter offset vs the
+  // half-campaign timeline the cutoffRounds were calibrated against, so
+  // the parts-decline penalty must shift with it — otherwise an
+  // in-production type gets penalised 15 years early.
+  const cutoff = spec.cutoffRound + (campaignMode === "full" ? 60 : 0);
+  const roundsSince = currentQuarter - cutoff;
   if (roundsSince <= 0) return 1.0;
   const fullRate =
     roundsSince <= 4  ? 0.05  :
@@ -199,9 +205,11 @@ export function discontinuedMaintenanceMultiplier(
 export function discontinuedMaintenanceBracket(
   spec: { cutoffRound?: number } | undefined,
   currentQuarter: number,
+  campaignMode: "half" | "full" = "half",
 ): { roundsSince: number; bracketLabel: string; pct: number; isMax: boolean } | null {
   if (!spec || typeof spec.cutoffRound !== "number") return null;
-  const roundsSince = currentQuarter - spec.cutoffRound;
+  const cutoff = spec.cutoffRound + (campaignMode === "full" ? 60 : 0);
+  const roundsSince = currentQuarter - cutoff;
   if (roundsSince <= 0) return null;
   // Phase 2 (P1-8) — labels used to say "1 of 3", "2 of 3", "3 of 3"
   // and then mysteriously jumped to a +15% flatline with no label.
@@ -966,6 +974,30 @@ export function effectiveUnlockQuarter(
     return Math.max(spec.unlockQuarter, eisQuarter);
   }
   return spec.unlockQuarter;
+}
+
+/** The round an airframe is discontinued (vanishes from the New-Build
+ *  market) for a given campaign.
+ *
+ *  Like `unlockQuarter`, every `cutoffRound` in the catalogue was
+ *  calibrated against the HALF campaign timeline, where round N maps to
+ *  calendar year 2015 + floor((N-1)/4). The FULL campaign starts in 2000,
+ *  so the SAME round number arrives 15 years (60 quarters) earlier — which
+ *  was prematurely discontinuing in-production airframes (e.g. the A330
+ *  disappeared from the Airbus tab barely a few years into a full
+ *  campaign). Shifting the cutoff by +60 quarters in the full campaign
+ *  preserves the original calendar-year discontinuation the half-campaign
+ *  pacing intended (mirrors the +60 world-news offset). A defensive
+ *  `max(..., effectiveUnlock)` guard guarantees a spec can never be
+ *  discontinued before it has even unlocked. */
+export function effectiveCutoffRound(
+  spec: { unlockQuarter: number; eisYear?: number; cutoffRound?: number },
+  campaignMode: "half" | "full" = "half",
+): number | undefined {
+  if (typeof spec.cutoffRound !== "number") return undefined;
+  if (campaignMode !== "full") return spec.cutoffRound;
+  const shifted = spec.cutoffRound + 60;
+  return Math.max(shifted, effectiveUnlockQuarter(spec, campaignMode));
 }
 
 // ─── Pricing multipliers (PRD §5.5 + §17) ──────────────────
@@ -3584,6 +3616,7 @@ export function runQuarterClose(
       AIRCRAFT_BY_ID[f.specId],
       ctx.quarter,
       !!f.ecoUpgrade,
+      (ctx.totalRounds ?? 60) > 60 ? "full" : "half",
     );
     maintenanceCost += f.purchasePrice * effectivePct * escalationMult;
   }

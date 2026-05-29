@@ -11,7 +11,7 @@ import {
   isReleased,
 } from "@/lib/pre-orders";
 import { useGame, selectPlayer, useCampaignStartYear } from "@/store/game";
-import { effectiveUnlockQuarter } from "@/lib/engine";
+import { effectiveUnlockQuarter, effectiveCutoffRound } from "@/lib/engine";
 import { cn } from "@/lib/cn";
 import { Plane, ChevronDown, ChevronUp, GitCompare, X } from "lucide-react";
 import type { AircraftSpec, SecondHandListing, CabinAmenities, CargoBellyTier } from "@/types/game";
@@ -190,10 +190,13 @@ export function AircraftMarketModal({
       // Hide specs that haven't even been announced yet.
       const announcedAt = effectiveUnlockQuarter(a, campaignMode) - 2;
       if (announcedAt > currentQuarter) continue;
-      // Discontinuation filter (Update 4): once cutoffRound is reached
-      // the spec disappears from the New-Build market. Existing fleet
-      // keeps flying and the secondary-market tab is unaffected.
-      if (typeof a.cutoffRound === "number" && currentQuarter > a.cutoffRound) continue;
+      // Discontinuation filter (Update 4): once the cutoff round is
+      // reached the spec disappears from the New-Build market. Existing
+      // fleet keeps flying and the secondary-market tab is unaffected.
+      // Use the campaign-adjusted cutoff so full campaigns (2000 start)
+      // don't discontinue in-production airframes 15 years too early.
+      const cutoff = effectiveCutoffRound(a, campaignMode);
+      if (typeof cutoff === "number" && currentQuarter > cutoff) continue;
       out[detectManufacturer(a)].push(a);
     }
     const variantOrder = (id: string): [number, string] => {
@@ -556,6 +559,7 @@ export function AircraftMarketModal({
         open={compareOpen}
         onClose={() => setCompareOpen(false)}
         specs={compareSpecs}
+        campaignMode={campaignMode}
         onPick={(specId) => {
           setCompareOpen(false);
           setCompareSpecIds([]);

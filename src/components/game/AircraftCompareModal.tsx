@@ -3,7 +3,7 @@
 import { Modal, ModalBody, ModalHeader, Badge, Button } from "@/components/ui";
 import { fmtMoney } from "@/lib/format";
 import { planeImagePath } from "@/lib/aircraft-images";
-import { cruiseSpeedKmh } from "@/lib/engine";
+import { cruiseSpeedKmh, effectiveCutoffRound } from "@/lib/engine";
 import { Plane, Trophy } from "lucide-react";
 import { cn } from "@/lib/cn";
 import type { AircraftSpec } from "@/types/game";
@@ -15,6 +15,9 @@ export interface AircraftCompareModalProps {
   /** Selected for buy from the compare panel — shortcut so the player
    *  can act without bouncing back to the market list. */
   onPick?: (specId: string) => void;
+  /** Campaign mode so the discontinuation label shows the era-adjusted
+   *  cutoff round (full campaigns are offset +60 quarters). */
+  campaignMode?: "half" | "full";
 }
 
 /**
@@ -28,7 +31,7 @@ export interface AircraftCompareModalProps {
  * at a glance.
  */
 export function AircraftCompareModal({
-  open, onClose, specs, onPick,
+  open, onClose, specs, onPick, campaignMode = "half",
 }: AircraftCompareModalProps) {
   if (specs.length === 0) return null;
 
@@ -96,7 +99,10 @@ export function AircraftCompareModal({
               </div>
               <div className="text-[0.625rem] uppercase tracking-wider text-ink-muted">
                 {s.family}
-                {s.cutoffRound && ` · cutoff Q${s.cutoffRound}`}
+                {(() => {
+                  const c = effectiveCutoffRound(s, campaignMode);
+                  return typeof c === "number" ? ` · cutoff Q${c}` : null;
+                })()}
               </div>
               {onPick && (
                 <Button

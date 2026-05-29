@@ -11,7 +11,7 @@ import { fmtMoney, fmtPct, fmtAgeYQ, fmtQuarter } from "@/lib/format";
 import { planeImagePath } from "@/lib/aircraft-images";
 import { cn } from "@/lib/cn";
 import { Plane, AlertTriangle, Clock, X } from "lucide-react";
-import { discontinuedMaintenanceBracket, effectiveUnlockQuarter } from "@/lib/engine";
+import { discontinuedMaintenanceBracket, effectiveUnlockQuarter, effectiveCutoffRound } from "@/lib/engine";
 import {
   effectiveProductionCap,
   estimatedDeliveryQuarter,
@@ -357,12 +357,13 @@ export function FleetPanel() {
                           // Update 5: discontinued-type maintenance escalation
                           // badge. Shows the bracket so the player knows WHY
                           // their maintenance jumped on this fleet line.
-                          const br = discontinuedMaintenanceBracket(spec, s.currentQuarter);
+                          const br = discontinuedMaintenanceBracket(spec, s.currentQuarter, s.session?.campaignMode);
                           if (!br) return null;
+                          const effCutoff = effectiveCutoffRound(spec, s.session?.campaignMode);
                           return (
                             <span
                               className="inline-flex items-center gap-1 text-[0.625rem] uppercase tracking-wider font-semibold text-warning bg-[var(--warning-soft)] px-1.5 py-0.5 rounded"
-                              title={`Production for this aircraft ended R${spec.cutoffRound}. Parts availability declining — maintenance +${br.pct}% (bracket ${br.bracketLabel}).`}
+                              title={`Production for this aircraft ended R${effCutoff ?? spec.cutoffRound}. Parts availability declining — maintenance +${br.pct}% (bracket ${br.bracketLabel}).`}
                             >
                               <AlertTriangle size={10} />
                               Discontinued · maint +{br.pct}%
