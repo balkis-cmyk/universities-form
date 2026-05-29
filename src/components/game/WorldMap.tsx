@@ -110,70 +110,64 @@ function shiftPolyline(
   return positions.map(([lat, lon]) => [lat, lon + lonOffset]);
 }
 
-/** Sample N points along a great-circle path from a→b, blended
- *  toward the rhumb-line for a more visually subtle curve, and
- *  unwrapped across the antimeridian so trans-Pacific routes
- *  (LAX→SYD, JFK→HKG, etc.) don't draw a horizontal stripe across
- *  the whole map.
+/** Sample N points along a smooth, flight-map-style arc from a→b.
  *
- *  `flatness` (0..1) blends each great-circle point toward the
- *  straight rhumb-line interpolation at the same t. 0 = pure great
- *  circle (heavily curved on Mercator), 1 = straight Mercator line.
- *  Default 0.4 — keeps the arc readable without exaggerating it.
+ *  WHY NOT A RAW GREAT CIRCLE: a true great circle plotted on a
+ *  Mercator map plateaus near its apex — the latitude derivative goes
+ *  to zero, so a long east-west route draws a wide *flat horizontal
+ *  segment* across the top of its arc ("flat over the pole"), which
+ *  reads as a bug rather than a curve. Mercator's vertical stretch at
+ *  high latitudes exaggerates it further.
  *
- *  Antimeridian unwrap: after sampling, walk through the points
- *  and add ±360° to consecutive longitudes if their delta exceeds
- *  180°. Leaflet's `worldCopyJump` paints the polyline correctly
- *  in the chosen world copy, so a continuous monotonic longitude
- *  sequence renders as one clean arc instead of a wraparound
- *  stripe. */
+ *  Instead we draw a controlled perpendicular bow: linear interpolation
+ *  along the short-way chord, plus a `sin(πf)` displacement toward the
+ *  nearer pole. `sin(πf)` is 0 at both endpoints and peaks once in the
+ *  middle, giving a single smoothly-rounded apex (never a plateau). The
+ *  bow magnitude scales with the route's east-west span but is capped,
+ *  and the final latitude is clamped well short of the pole, so arcs
+ *  always curve nicely across the world and never run flat along the
+ *  top edge.
+ *
+ *  Antimeridian unwrap: after sampling, walk through the points and add
+ *  ±360° to consecutive longitudes if their delta exceeds 180°. Leaflet's
+ *  `worldCopyJump` paints the polyline correctly in the chosen world
+ *  copy, so a continuous monotonic longitude sequence renders as one
+ *  clean arc instead of a wraparound stripe. */
 function greatCirclePath(
   aLon: number, aLat: number,
   bLon: number, bLat: number,
   steps = 64,
-  flatness = 0.4,
 ): [number, number][] {
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const toDeg = (r: number) => (r * 180) / Math.PI;
-  const φ1 = toRad(aLat), λ1 = toRad(aLon);
-  const φ2 = toRad(bLat), λ2 = toRad(bLon);
-  const Δφ = φ2 - φ1, Δλ = λ2 - λ1;
-  const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2;
-  const c = 2 * Math.asin(Math.sqrt(Math.min(1, a)));
-  if (c === 0) return [[aLat, aLon], [bLat, bLon]];
-  const out: [number, number][] = [];
-  // dLon is the SHORT-way delta from a to b (always within ±180°).
-  // Both gcLon and linLon must use this frame, or the blend lands
-  // halfway around the planet.
+  // dLon is the SHORT-way delta from a to b (always within ±180°), so a
+  // JFK→Tokyo route flows west across the Pacific instead of long-way
+  // east across the Atlantic.
   let dLon = bLon - aLon;
   if (dLon > 180) dLon -= 360;
   if (dLon < -180) dLon += 360;
+  const dLat = bLat - aLat;
+
+  // Bow toward the nearer pole (whichever endpoint sits at higher
+  // absolute latitude), so the arc mimics a real great-circle's
+  // poleward lean without inheriting its flat apex.
+  const poleSign = (Math.abs(aLat) >= Math.abs(bLat) ? aLat : bLat) >= 0 ? 1 : -1;
+  // Bow magnitude scales with the route's TOTAL angular span (both lon
+  // and lat), so every route — not just wide east-west ones — gets a
+  // smooth, proportional arc. The lon term is weighted heavier because
+  // east-west routes read flattest on Mercator and need the most help.
+  // Capped at 18° so it never balloons toward the pole.
+  const span = Math.hypot(Math.abs(dLon) * 1.0, Math.abs(dLat) * 0.5);
+  const bow = Math.min(18, span * 0.13);
+
+  const out: [number, number][] = [];
   for (let i = 0; i <= steps; i++) {
     const f = i / steps;
-    const A = Math.sin((1 - f) * c) / Math.sin(c);
-    const B = Math.sin(f * c) / Math.sin(c);
-    const x = A * Math.cos(φ1) * Math.cos(λ1) + B * Math.cos(φ2) * Math.cos(λ2);
-    const y = A * Math.cos(φ1) * Math.sin(λ1) + B * Math.cos(φ2) * Math.sin(λ2);
-    const z = A * Math.sin(φ1) + B * Math.sin(φ2);
-    const gcLat = toDeg(Math.atan2(z, Math.sqrt(x * x + y * y)));
-    let gcLon = toDeg(Math.atan2(y, x));
-    // Rhumb (loxodrome) longitude at the same fraction f. Uses the
-    // SHORT-way dLon so a JFK→Tokyo route flows west across the
-    // Pacific instead of long-way east across the Atlantic.
-    const linLat = aLat + (bLat - aLat) * f;
-    const linLon = aLon + dLon * f;
-    // CRITICAL: gcLon comes out of atan2 in [-180, 180], but linLon
-    // can be anywhere (e.g. -220 for a JFK→Tokyo path). When the two
-    // differ by ~360° they describe the SAME point on the sphere but
-    // the blend treats them as 360° apart and lands halfway around
-    // the world. Normalize gcLon into the same frame as linLon before
-    // blending — pull it to whichever ±360° copy is closest to linLon.
-    while (gcLon - linLon > 180) gcLon -= 360;
-    while (gcLon - linLon < -180) gcLon += 360;
-    out.push([
-      gcLat + (linLat - gcLat) * flatness,
-      gcLon + (linLon - gcLon) * flatness,
-    ]);
+    const baseLat = aLat + dLat * f;
+    const baseLon = aLon + dLon * f;
+    const bell = Math.sin(Math.PI * f); // 0 → 1 → 0, single rounded apex
+    // Clamp short of the Mercator limit (~85°) so the arc never clips
+    // flat against the top edge of the projected map.
+    const lat = Math.max(-78, Math.min(78, baseLat + poleSign * bow * bell));
+    out.push([lat, baseLon]);
   }
   // Antimeridian unwrap — accumulate longitude deltas so the polyline
   // never jumps ±360 in one step. Leaflet renders the resulting
@@ -270,17 +264,56 @@ function FlyingPlane({
 }) {
   const markerRef = useRef<L.Marker | null>(null);
   // Pre-compute bearings between consecutive points so the glyph nose
-  // turns smoothly along the great circle without a per-frame trig hit.
-  const bearings = useMemo(() => {
-    const out: number[] = [];
+  // turns smoothly along the great circle without a per-frame trig hit,
+  // plus the CUMULATIVE on-screen (Web-Mercator-projected) length of the
+  // path. Driving the animation by projected distance — not by segment
+  // index — keeps the plane's screen speed constant. Sampling by index
+  // made the plane lurch faster near an arc's apex, where Mercator
+  // stretches latitude and each equal-time segment covers more pixels.
+  const { bearings, cum, total } = useMemo(() => {
+    const bear: number[] = [];
+    const cumDist: number[] = [0];
+    // Web-Mercator y so segment lengths match what's actually drawn.
+    const mercY = (lat: number) => {
+      const clamped = Math.max(-85, Math.min(85, lat));
+      return Math.log(Math.tan(Math.PI / 4 + (clamped * Math.PI) / 360));
+    };
     for (let i = 0; i < positions.length - 1; i++) {
       const [aLat, aLon] = positions[i];
       const [bLat, bLon] = positions[i + 1];
-      out.push(bearingDeg(aLat, aLon, bLat, bLon));
+      bear.push(bearingDeg(aLat, aLon, bLat, bLon));
+      const dx = bLon - aLon;
+      const dy = mercY(bLat) - mercY(aLat);
+      cumDist.push(cumDist[i] + Math.hypot(dx, dy));
     }
-    out.push(out[out.length - 1] ?? 0);
-    return out;
+    bear.push(bear[bear.length - 1] ?? 0);
+    return { bearings: bear, cum: cumDist, total: cumDist[cumDist.length - 1] || 1 };
   }, [positions]);
+
+  // Map a 0..1 progress fraction to a point on the polyline by PROJECTED
+  // distance, returning the interpolated lat/lon and the segment index
+  // (for bearing lookup).
+  const sampleAt = useMemo(() => {
+    return (f: number): { lat: number; lon: number; seg: number } => {
+      if (positions.length < 2) {
+        const [lat, lon] = positions[0] ?? [0, 0];
+        return { lat, lon, seg: 0 };
+      }
+      const target = f * total;
+      // Linear scan — paths are ≤65 points, so this is cheap per frame.
+      let i = 0;
+      while (i < cum.length - 2 && cum[i + 1] < target) i++;
+      const segLen = cum[i + 1] - cum[i] || 1;
+      const frac = Math.max(0, Math.min(1, (target - cum[i]) / segLen));
+      const [aLat, aLon] = positions[i];
+      const [bLat, bLon] = positions[i + 1];
+      return {
+        lat: aLat + (bLat - aLat) * frac,
+        lon: aLon + (bLon - aLon) * frac,
+        seg: i,
+      };
+    };
+  }, [positions, cum, total]);
 
   useEffect(() => {
     if (positions.length < 2) return;
@@ -298,17 +331,11 @@ function FlyingPlane({
       const t = elapsed % 2;
       const forward = t < 1;
       const f = forward ? t : 2 - t;
-      const idxF = f * (positions.length - 1);
-      const i = Math.min(positions.length - 2, Math.floor(idxF));
-      const frac = idxF - i;
-      const [aLat, aLon] = positions[i];
-      const [bLat, bLon] = positions[i + 1];
-      const lat = aLat + (bLat - aLat) * frac;
-      const lon = aLon + (bLon - aLon) * frac;
+      const { lat, lon, seg } = sampleAt(f);
       m.setLatLng([lat, lon]);
       // Bearing flips by 180° on the return leg so the nose stays
       // pointing in the direction of travel.
-      const bearing = bearings[i] + (forward ? 0 : 180);
+      const bearing = bearings[seg] + (forward ? 0 : 180);
       const el = m.getElement();
       const glyph = el?.querySelector<HTMLElement>("[data-plane]");
       if (glyph) {
@@ -318,18 +345,13 @@ function FlyingPlane({
     };
     raf = requestAnimationFrame(step);
     return () => cancelAnimationFrame(raf);
-  }, [positions, durationMs, phase, bearings]);
+  }, [positions, durationMs, phase, bearings, sampleAt]);
 
-  // Initial position = sample at phase
+  // Initial position = sample at phase (also by projected distance).
   const initial = useMemo(() => {
-    if (positions.length < 2) return positions[0] ?? [0, 0];
-    const idxF = phase * (positions.length - 1);
-    const i = Math.min(positions.length - 2, Math.floor(idxF));
-    const frac = idxF - i;
-    const [aLat, aLon] = positions[i];
-    const [bLat, bLon] = positions[i + 1];
-    return [aLat + (bLat - aLat) * frac, aLon + (bLon - aLon) * frac] as [number, number];
-  }, [positions, phase]);
+    const { lat, lon } = sampleAt(phase);
+    return [lat, lon] as [number, number];
+  }, [sampleAt, phase]);
 
   return (
     <Marker

@@ -5,7 +5,7 @@ import { Badge, Input, Modal, ModalBody, ModalFooter, ModalHeader, Button } from
 import { useGame, selectPlayer } from "@/store/game";
 import { useUi } from "@/store/ui";
 import { fmtMoney, fmtPct } from "@/lib/format";
-import { CITIES, CITIES_BY_CODE } from "@/data/cities";
+import { CITIES, CITIES_BY_CODE, cityMatchesQuery, countryForCode } from "@/data/cities";
 import { AIRCRAFT_BY_ID } from "@/data/aircraft";
 import { classDemandShares, classFareRangeForDoctrine, distanceBetween, effectiveRangeKm, maxRouteDailyFrequency, routeDemandPerDay } from "@/lib/engine";
 import type { CityTier, PricingTier, Route } from "@/types/game";
@@ -61,6 +61,19 @@ export function RoutesPanel() {
   const [pickerOrigin, setPickerOrigin] = useState<string | null>(null);
   const [pickerDest, setPickerDest] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
+
+  // Longest range any owned aircraft can fly (honouring engine
+  // retrofits). Feeds the destination picker's "in range" indicator so
+  // the player can see which cities their current fleet can actually
+  // reach from a chosen origin. 0 when the player has no aircraft.
+  const maxFleetRangeKm = useMemo(() => {
+    if (!player) return 0;
+    return player.fleet.reduce((max, f) => {
+      const spec = AIRCRAFT_BY_ID[f.specId];
+      if (!spec) return max;
+      return Math.max(max, effectiveRangeKm(spec, f.engineUpgrade ?? null));
+    }, 0);
+  }, [player]);
 
   // If GameCanvas asked us to focus a specific route (because the player
   // clicked an existing route's endpoints on the map), auto-open it once.
@@ -575,6 +588,7 @@ export function RoutesPanel() {
               .flatMap((r) => [r.originCode, r.destCode]),
           ])
         }
+        maxFleetRangeKm={maxFleetRangeKm}
       />
 
       {/* Hand off to the existing route setup flow once both endpoints are picked. */}
@@ -601,13 +615,16 @@ export function RoutesPanel() {
  * player most often needs.
  */
 function NewRoutePicker({
-  open, origin, dest, ownedCodes,
+  open, origin, dest, ownedCodes, maxFleetRangeKm,
   onOriginChange, onDestChange, onCancel, onConfirm,
 }: {
   open: boolean;
   origin: string | null;
   dest: string | null;
   ownedCodes: Set<string>;
+  /** Longest range (km) any aircraft currently in the fleet can fly.
+   *  Used to flag destinations no plane can reach from the chosen origin. */
+  maxFleetRangeKm: number;
   onOriginChange: (code: string | null) => void;
   onDestChange: (code: string | null) => void;
   onCancel: () => void;
@@ -615,6 +632,7 @@ function NewRoutePicker({
 }) {
   const [search, setSearch] = useState("");
   const [picking, setPicking] = useState<"origin" | "dest" | null>(null);
+  const [inRangeOnly, setInRangeOnly] = useState(false);
 
   // When picking destination AND we have an origin, sort by distance
   // ascending so the player can see "what's nearby". Otherwise (origin
@@ -637,16 +655,26 @@ function NewRoutePicker({
     [ownedCodes, sortRef],
   );
 
+  // "In range" only makes sense when picking a destination from a known
+  // origin (we need a distance to compare) and the fleet has any aircraft.
+  const rangeFilterAvailable =
+    picking === "dest" && !!sortRef && maxFleetRangeKm > 0;
+
   const filtered = useMemo(() => {
-    const q = search.trim().toLowerCase();
-    if (!q) return sortedCities;
-    return sortedCities.filter(
-      ({ city: c }) =>
-        c.code.toLowerCase().includes(q) ||
-        c.name.toLowerCase().includes(q) ||
-        c.regionName.toLowerCase().includes(q),
-    );
-  }, [sortedCities, search]);
+    const q = search.trim();
+    let list = sortedCities;
+    if (q) {
+      // Smart match — code, city, continent, country + aliases. Lets the
+      // player type "brazil", "uae", "korea" and get the right cities.
+      list = list.filter(({ city: c }) => cityMatchesQuery(c, q));
+    }
+    if (rangeFilterAvailable && inRangeOnly) {
+      // Keep the origin itself (distance 0) out — it's excluded from dest
+      // anyway — and any city the longest-range plane can reach.
+      list = list.filter(({ distance }) => distance > 0 && distance <= maxFleetRangeKm);
+    }
+    return list;
+  }, [sortedCities, search, rangeFilterAvailable, inRangeOnly, maxFleetRangeKm]);
 
   // Group filtered cities by region for the collapsed view. Owned
   // ("Your network") cities pulled out to the top. Within each
@@ -748,11 +776,34 @@ function NewRoutePicker({
             </div>
             <Input
               autoFocus
-              placeholder="Search by code, city, or region…"
+              placeholder="Search by code, city, country, or region…"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               className="mb-2 h-9 text-[0.875rem]"
             />
+            {rangeFilterAvailable && (
+              <button
+                type="button"
+                onClick={() => setInRangeOnly((v) => !v)}
+                className={cn(
+                  "mb-2 inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-[0.6875rem] font-semibold transition-colors",
+                  inRangeOnly
+                    ? "border-primary bg-[rgba(20,53,94,0.06)] text-primary"
+                    : "border-line text-ink-muted hover:bg-surface-hover",
+                )}
+              >
+                <span
+                  className={cn(
+                    "inline-block w-3 h-3 rounded-[3px] border",
+                    inRangeOnly ? "border-primary bg-primary" : "border-line",
+                  )}
+                />
+                In range only
+                <span className="font-normal text-ink-muted">
+                  (≤ {Math.round(maxFleetRangeKm).toLocaleString()} km)
+                </span>
+              </button>
+            )}
             <div className="max-h-[320px] overflow-y-auto rounded-md border border-line bg-surface">
               {filtered.length === 0 ? (
                 <div className="py-6 text-center text-[0.8125rem] text-ink-muted">
@@ -768,6 +819,7 @@ function NewRoutePicker({
                       sortRef={sortRef}
                       origin={origin}
                       picking={picking}
+                      maxFleetRangeKm={maxFleetRangeKm}
                       onPick={pick}
                     />
                   )}
@@ -779,6 +831,7 @@ function NewRoutePicker({
                       sortRef={sortRef}
                       origin={origin}
                       picking={picking}
+                      maxFleetRangeKm={maxFleetRangeKm}
                       onPick={pick}
                     />
                   ))}
@@ -2407,16 +2460,20 @@ function TournamentBanner() {
  *  code, name, distance (when sorting by distance from origin), and
  *  a "Network" badge when in player's owned set. No tier label. */
 function RegionSection({
-  label, entries, sortRef, origin, picking, onPick,
+  label, entries, sortRef, origin, picking, maxFleetRangeKm, onPick,
 }: {
   label: string;
   entries: Array<{ city: import("@/types/game").City; distance: number }>;
   sortRef: string | null;
   origin: string | null;
   picking: "origin" | "dest" | null;
+  maxFleetRangeKm: number;
   onPick: (code: string) => void;
 }) {
   const [open, setOpen] = useState(true);
+  // Only flag out-of-range when picking a destination from a known origin
+  // and we actually have a fleet to measure against.
+  const canFlagRange = picking === "dest" && !!sortRef && maxFleetRangeKm > 0;
   return (
     <div className="border-b border-line last:border-0">
       <button
@@ -2433,7 +2490,10 @@ function RegionSection({
       </button>
       {open && (
         <div>
-          {entries.slice(0, 50).map(({ city: c, distance }) => (
+          {entries.slice(0, 50).map(({ city: c, distance }) => {
+            const country = countryForCode(c.code);
+            const outOfRange = canFlagRange && distance > maxFleetRangeKm;
+            return (
             <button
               key={c.code}
               onClick={() => onPick(c.code)}
@@ -2447,14 +2507,32 @@ function RegionSection({
               <span className="font-mono font-semibold text-ink shrink-0 w-10">
                 {c.code}
               </span>
-              <span className="text-ink-2 flex-1 truncate">{c.name}</span>
+              <span className="text-ink-2 flex-1 truncate">
+                {c.name}
+                {country && (
+                  <span className="text-ink-muted">
+                    {" · "}{country}
+                  </span>
+                )}
+              </span>
+              {outOfRange && (
+                <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-negative shrink-0">
+                  Out of range
+                </span>
+              )}
               {sortRef && distance > 0 && (
-                <span className="text-[0.6875rem] text-ink-muted tabular shrink-0">
+                <span
+                  className={cn(
+                    "text-[0.6875rem] tabular shrink-0",
+                    outOfRange ? "text-negative" : "text-ink-muted",
+                  )}
+                >
                   {Math.round(distance).toLocaleString()} km
                 </span>
               )}
             </button>
-          ))}
+            );
+          })}
           {entries.length > 50 && (
             <div className="px-3 py-1 text-[0.625rem] text-ink-muted italic border-t border-line/40">
               + {entries.length - 50} more — refine the search above

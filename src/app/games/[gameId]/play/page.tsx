@@ -29,7 +29,8 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, AlertCircle, Loader2 } from "lucide-react";
 import { GuestAccessPrompt } from "@/components/auth/GuestAccessPrompt";
 import { useMultiplayerSession } from "@/lib/games/useMultiplayerSession";
-import { useGame } from "@/store/game";
+import { useGame, readLocalGameJournal } from "@/store/game";
+import { toast } from "@/store/toasts";
 import { getBrowserClient } from "@/lib/supabase/browser";
 import type { GameRow, GameMemberRow } from "@/lib/supabase/types";
 import { GameCanvas } from "@/components/game/GameCanvas";
@@ -61,6 +62,7 @@ export default function GamePlayPage({
     continueAsGuest,
   } = useMultiplayerSession({ autoGuest: true });
   const hydrateFromServerState = useGame((s) => s.hydrateFromServerState);
+  const pushStateToServer = useGame((s) => s.pushStateToServer);
   const setQuarterCloseRequest = useGame((s) => s.setQuarterCloseRequest);
   const phase = useGame((s) => s.phase);
   const teamsCount = useGame((s) => s.teams.length);
@@ -170,20 +172,44 @@ export default function GamePlayPage({
     }
     const hydrateStart = typeof performance !== "undefined" ? performance.now() : Date.now();
     const fallbackTeamId = data.members.find((m) => m.session_id === sessionId)?.team_id ?? null;
+
+    // DATA-LOSS RECOVERY: before trusting the server snapshot, check the
+    // local write-through journal. The journal holds the last stateJson this
+    // browser ATTEMPTED to push. If its currentQuarter is AHEAD of the
+    // server's, it means we advanced one or more quarters whose push never
+    // landed (lost connection, or the tab closed mid-flight). Hydrate from
+    // the journal instead and reconcile it back to the server so a hard
+    // refresh on a flaky connection loses at most the in-flight quarter
+    // rather than rolling back ~a year of play.
+    //
+    // This is safe for multi-human cohorts too: the journal can only be
+    // ahead if THIS browser is the one that advanced those quarters, and
+    // the reconcile push goes through the same CAS guard as any other write.
+    const serverState = data.state.state_json as { currentQuarter?: number } | null;
+    const serverQuarter =
+      serverState && typeof serverState.currentQuarter === "number"
+        ? serverState.currentQuarter
+        : 0;
+    const journal = readLocalGameJournal(gameId);
+    const journalAhead = Boolean(journal && journal.currentQuarter > serverQuarter);
+
     const result = hydrateFromServerState({
-      stateJson: data.state.state_json,
+      stateJson: journalAhead ? journal!.stateJson : data.state.state_json,
       mySessionId: sessionId,
       fallbackTeamId,
       // Pass the real game_state.version so pushStateToServer sends the
       // correct expectedVersion. Without this, the embedded session.version
       // (which diverges after the start/seed writes) is used and every GM
-      // push gets a 409 "stale write" on the very first try.
+      // push gets a 409 "stale write" on the very first try. Even when we
+      // hydrate from the journal we use the DB version here so the reconcile
+      // push's CAS matches the server's current row.
       dbVersion: data.state.version,
     });
     const hydrateEnd = typeof performance !== "undefined" ? performance.now() : Date.now();
     // eslint-disable-next-line no-console
     console.info("[play] hydrate timing", {
       hydrateMs: Math.round(hydrateEnd - hydrateStart),
+      recoveredFromJournal: journalAhead,
     });
     if (!result.ok) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -194,7 +220,27 @@ export default function GamePlayPage({
     // which game this player belongs to; no browser-side key needed.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setHydrated(true);
-  }, [data, sessionId, hydrated, hydrateFromServerState, router]);
+
+    if (journalAhead && journal) {
+      // Push the recovered state straight back so the server catches up to
+      // the local journal. Reuse the "game.quarterClosed" eventType: it's
+      // exempt from the per-team-ownership check server-side, which matters
+      // because the recovered state includes bot-team mutations this
+      // session doesn't "own".
+      const recoveredQuarters = journal.currentQuarter - serverQuarter;
+      void pushStateToServer("game.quarterClosed", {
+        reconcile: true,
+        recoveredFromQuarter: serverQuarter,
+        recoveredToQuarter: journal.currentQuarter,
+      });
+      toast.success(
+        "Recovered your progress",
+        recoveredQuarters > 1
+          ? `Restored ${recoveredQuarters} quarters that hadn't finished saving and synced them to the server.`
+          : "Restored the last quarter that hadn't finished saving.",
+      );
+    }
+  }, [data, sessionId, hydrated, hydrateFromServerState, pushStateToServer, gameId, router]);
 
   // Step 3 — Supabase Realtime: re-hydrate whenever any player pushes
   // new state for this game. Each game has its own game_state row

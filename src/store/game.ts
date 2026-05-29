@@ -745,6 +745,114 @@ function fmtMoneyPlain(n: number): string {
   return `$${n.toFixed(0)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Local write-through journal (data-loss safety net)
+// ---------------------------------------------------------------------------
+// Server-backed games persist ONLY via server pushes — there is no Zustand
+// localStorage persist middleware for them. If a push fails (lost connection,
+// tab closed mid-flight) the quarter's state is never written to the DB and a
+// refresh rolls the game back to the last server-persisted version. Workshop
+// play surfaced ~4 quarters (~1 year) of progress vanishing after a hard
+// refresh on a flaky connection.
+//
+// The journal closes that gap: on EVERY push attempt we synchronously stash
+// the exact stateJson we're about to send into localStorage, keyed by gameId.
+// On the next page load the play page compares the journal's currentQuarter to
+// the server's; if the journal is AHEAD (this browser advanced quarters that
+// never made it to the DB) we hydrate from the journal and reconcile back to
+// the server. Worst-case loss is bounded to a single in-flight quarter.
+const JOURNAL_KEY_PREFIX = "skyhigh:journal:";
+
+export interface LocalGameJournal {
+  gameId: string;
+  /** serverStateVersion that was the expectedVersion for this push attempt. */
+  expectedVersion: number;
+  currentQuarter: number;
+  /** Date.now() when the entry was written. */
+  savedAt: number;
+  /** The byte-for-byte stateJson we attempted to push. */
+  stateJson: unknown;
+}
+
+function writeLocalJournal(entry: LocalGameJournal): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.setItem(
+      JOURNAL_KEY_PREFIX + entry.gameId,
+      JSON.stringify(entry),
+    );
+  } catch {
+    // Quota exceeded / private-mode / disabled storage — the journal is a
+    // best-effort safety net, never let it throw into the push path.
+  }
+}
+
+export function readLocalGameJournal(gameId: string): LocalGameJournal | null {
+  if (typeof localStorage === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(JOURNAL_KEY_PREFIX + gameId);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as LocalGameJournal;
+    if (
+      !parsed ||
+      parsed.gameId !== gameId ||
+      typeof parsed.currentQuarter !== "number" ||
+      typeof parsed.expectedVersion !== "number" ||
+      parsed.stateJson == null
+    ) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function clearLocalGameJournal(gameId: string): void {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.removeItem(JOURNAL_KEY_PREFIX + gameId);
+  } catch {
+    // ignore
+  }
+}
+
+// Build the partialize-compatible stateJson payload that both pushStateToServer
+// and flushStateBeacon ship. Extracted so the two paths can never drift (a
+// drift would mean a beacon-flushed state hydrates differently than a normal
+// push). Sets are serialized as arrays (JSON-safe); the session version is
+// bumped forward so a subsequent hydrate picks up the new version.
+function buildPushStateJson(
+  s: GameStore,
+  session: NonNullable<GameStore["session"]>,
+) {
+  return {
+    phase: s.phase,
+    currentQuarter: s.currentQuarter,
+    fuelIndex: s.fuelIndex,
+    baseInterestRatePct: s.baseInterestRatePct,
+    teams: s.teams.map((t) => ({
+      ...t,
+      flags: Array.from(t.flags) as unknown as Set<string>,
+    })),
+    quarterTimerSecondsRemaining: s.quarterTimerSecondsRemaining,
+    quarterTimerPaused: s.quarterTimerPaused,
+    secondHandListings: s.secondHandListings,
+    cargoContracts: s.cargoContracts,
+    airportSlots: s.airportSlots,
+    airportBids: s.airportBids,
+    worldCupHostCode: s.worldCupHostCode,
+    olympicHostCode: s.olympicHostCode,
+    sessionCode: s.sessionCode,
+    sessionLocked: s.sessionLocked,
+    sessionSlots: s.sessionSlots,
+    preOrders: s.preOrders,
+    productionCapOverrides: s.productionCapOverrides,
+    quarterCloseRequest: s.quarterCloseRequest,
+    session: { ...session, version: session.version + 1 },
+  };
+}
+
 /** Pure helper that delivers a list of queued PreOrders. Charges the
  *  balance (price − deposit) on each team, builds the FleetAircraft
  *  rows, and returns updated `preOrders` + `teams` arrays. The caller
@@ -7473,31 +7581,17 @@ export const useGame = create<GameStore>()(
         const sessionId = s.localSessionId;
         if (!sessionId) return false;
         const actorTeamId = s.activeTeamId ?? s.playerTeamId ?? undefined;
-        const stateJson = {
-          phase: s.phase,
+        const stateJson = buildPushStateJson(s, session);
+        // Write the journal before firing the beacon. Beacons are
+        // fire-and-forget and we never see their result, so the journal is
+        // the only guarantee that a tab-close flush is recoverable.
+        writeLocalJournal({
+          gameId: session.gameId,
+          expectedVersion: s.serverStateVersion,
           currentQuarter: s.currentQuarter,
-          fuelIndex: s.fuelIndex,
-          baseInterestRatePct: s.baseInterestRatePct,
-          teams: s.teams.map((t) => ({
-            ...t,
-            flags: Array.from(t.flags) as unknown as Set<string>,
-          })),
-          quarterTimerSecondsRemaining: s.quarterTimerSecondsRemaining,
-          quarterTimerPaused: s.quarterTimerPaused,
-          secondHandListings: s.secondHandListings,
-          cargoContracts: s.cargoContracts,
-          airportSlots: s.airportSlots,
-          airportBids: s.airportBids,
-          worldCupHostCode: s.worldCupHostCode,
-          olympicHostCode: s.olympicHostCode,
-          sessionCode: s.sessionCode,
-          sessionLocked: s.sessionLocked,
-          sessionSlots: s.sessionSlots,
-          preOrders: s.preOrders,
-          productionCapOverrides: s.productionCapOverrides,
-          quarterCloseRequest: s.quarterCloseRequest,
-          session: { ...session, version: session.version + 1 },
-        };
+          savedAt: Date.now(),
+          stateJson,
+        });
         const body = JSON.stringify({
           gameId: session.gameId,
           expectedVersion: s.serverStateVersion,
@@ -7557,33 +7651,7 @@ export const useGame = create<GameStore>()(
         // Build a partialize-compatible payload mirroring the persist
         // shape so a downstream `hydrateFromServerState` re-load lands
         // byte-equivalent. Sets are serialized as arrays (JSON-safe).
-        const stateJson = {
-          phase: s.phase,
-          currentQuarter: s.currentQuarter,
-          fuelIndex: s.fuelIndex,
-          baseInterestRatePct: s.baseInterestRatePct,
-          teams: s.teams.map((t) => ({
-            ...t,
-            flags: Array.from(t.flags) as unknown as Set<string>,
-          })),
-          quarterTimerSecondsRemaining: s.quarterTimerSecondsRemaining,
-          quarterTimerPaused: s.quarterTimerPaused,
-          secondHandListings: s.secondHandListings,
-          cargoContracts: s.cargoContracts,
-          airportSlots: s.airportSlots,
-          airportBids: s.airportBids,
-          worldCupHostCode: s.worldCupHostCode,
-          olympicHostCode: s.olympicHostCode,
-          sessionCode: s.sessionCode,
-          sessionLocked: s.sessionLocked,
-          sessionSlots: s.sessionSlots,
-          preOrders: s.preOrders,
-          productionCapOverrides: s.productionCapOverrides,
-          quarterCloseRequest: s.quarterCloseRequest,
-          // Mirror the session block forward so subsequent hydrates
-          // pick up the bumped version + any session metadata changes.
-          session: { ...session, version: session.version + 1 },
-        };
+        const stateJson = buildPushStateJson(s, session);
 
         if (typeof fetch === "undefined") return Promise.resolve({ ok: true as const });
         // Use the actual DB game_state.version (set during hydrateFromServerState
@@ -7592,6 +7660,21 @@ export const useGame = create<GameStore>()(
         // reliably — using it caused every first GM push to 409.
         const expectedVersion = s.serverStateVersion;
         const gameId = session.gameId;
+
+        // Write-through journal: stash the exact state we're about to push
+        // BEFORE the network call. This runs on every push attempt (quarter
+        // close, autoCommit edits) regardless of whether the fetch succeeds.
+        // If the push then fails (lost connection) or the tab closes before
+        // it lands, the next page load recovers from this journal instead of
+        // rolling back to the last server-persisted version. See the
+        // LocalGameJournal block near fmtMoneyPlain for the full rationale.
+        writeLocalJournal({
+          gameId,
+          expectedVersion,
+          currentQuarter: s.currentQuarter,
+          savedAt: Date.now(),
+          stateJson,
+        });
 
         // Phase 4.1: returns a Promise so callers that want to await
         // (closeQuarter especially) can do so. Existing fire-and-forget

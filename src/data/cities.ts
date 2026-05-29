@@ -1557,8 +1557,8 @@ export const CITIES: City[] = [
   {
     "code": "BGW",
     "name": "Baghdad",
-    "region": "me",
-    "regionName": "Middle East",
+    "region": "mea",
+    "regionName": "Middle East & Africa",
     "tier": 3,
     "tourism": 60,
     "business": 110,
@@ -1632,8 +1632,8 @@ export const CITIES: City[] = [
   {
     "code": "IKA",
     "name": "Tehran",
-    "region": "me",
-    "regionName": "Middle East",
+    "region": "mea",
+    "regionName": "Middle East & Africa",
     "tier": 2,
     "tourism": 80,
     "business": 150,
@@ -1668,3 +1668,114 @@ export const CITIES_BY_CODE: Record<string, City> = CITIES.reduce(
   },
   {} as Record<string, City>,
 );
+
+// ─── Country lookup ────────────────────────────────────────
+// The City record only carries a continent-level `region` ("na",
+// "eu", …). Players naturally search by country ("Brazil", "UAE"),
+// so we keep an IATA-code → country map here and feed it into the
+// shared `cityMatchesQuery` helper used by every city picker. Kept
+// as a separate map (not a City field) so the 110 city objects stay
+// untouched and the data is easy to audit at a glance.
+export const CITY_COUNTRY_BY_CODE: Record<string, string> = {
+  // North America
+  JFK: "United States", LAX: "United States", ORD: "United States",
+  SFO: "United States", IAD: "United States", BOS: "United States",
+  DFW: "United States", IAH: "United States", ATL: "United States",
+  MIA: "United States", SEA: "United States", DEN: "United States",
+  SAN: "United States", LAS: "United States", HNL: "United States",
+  PHX: "United States",
+  YYZ: "Canada", YUL: "Canada", YVR: "Canada",
+  MEX: "Mexico", GDL: "Mexico", MTY: "Mexico",
+  // Latin America
+  GRU: "Brazil", GIG: "Brazil",
+  EZE: "Argentina", SCL: "Chile", LIM: "Peru", BOG: "Colombia",
+  PTY: "Panama", CCS: "Venezuela", UIO: "Ecuador", GYE: "Ecuador",
+  MVD: "Uruguay", SJO: "Costa Rica", SDQ: "Dominican Republic",
+  SJU: "Puerto Rico", HAV: "Cuba",
+  // Europe
+  LHR: "United Kingdom", MAN: "United Kingdom",
+  CDG: "France", LYS: "France",
+  AMS: "Netherlands",
+  FRA: "Germany", MUC: "Germany", BER: "Germany", DUS: "Germany",
+  HAM: "Germany",
+  MAD: "Spain", BCN: "Spain",
+  FCO: "Italy", MXP: "Italy",
+  ZRH: "Switzerland", VIE: "Austria", BRU: "Belgium",
+  CPH: "Denmark", ARN: "Sweden", OSL: "Norway", DUB: "Ireland",
+  LIS: "Portugal", ATH: "Greece", IST: "Turkey", SVO: "Russia",
+  WAW: "Poland", KBP: "Ukraine", PRG: "Czech Republic",
+  // Middle East & Africa
+  DXB: "United Arab Emirates", AUH: "United Arab Emirates",
+  DOH: "Qatar", RUH: "Saudi Arabia", JED: "Saudi Arabia",
+  KWI: "Kuwait", BAH: "Bahrain", MCT: "Oman", AMM: "Jordan",
+  BEY: "Lebanon", CAI: "Egypt", CMN: "Morocco", ALG: "Algeria",
+  LOS: "Nigeria", NBO: "Kenya", JNB: "South Africa",
+  BGW: "Iraq", IKA: "Iran", ADD: "Ethiopia",
+  // Asia
+  NRT: "Japan", KIX: "Japan",
+  ICN: "South Korea",
+  PEK: "China", PVG: "China", CAN: "China",
+  HKG: "Hong Kong", TPE: "Taiwan",
+  BKK: "Thailand", SIN: "Singapore", KUL: "Malaysia",
+  MNL: "Philippines", CGK: "Indonesia", SUB: "Indonesia",
+  SGN: "Vietnam", HAN: "Vietnam",
+  DEL: "India", BOM: "India", MAA: "India", BLR: "India",
+  KHI: "Pakistan",
+  // Oceania
+  SYD: "Australia", MEL: "Australia", BNE: "Australia",
+  PER: "Australia", AKL: "New Zealand",
+};
+
+// Common alternate spellings / shorthands players type. Keyed by the
+// canonical country name above; each value is a list of extra terms
+// that should also match. Lets "USA", "UK", "UAE", "Holland", etc.
+// resolve to the right cities.
+const COUNTRY_ALIASES: Record<string, string[]> = {
+  "United States": ["usa", "us", "u.s.", "u.s.a", "america", "american", "states"],
+  "United Kingdom": ["uk", "u.k.", "britain", "british", "england", "great britain"],
+  "United Arab Emirates": ["uae", "u.a.e", "emirates"],
+  Netherlands: ["holland", "dutch"],
+  "Czech Republic": ["czechia"],
+  Turkey: ["turkiye", "türkiye"],
+  "South Korea": ["korea", "korean", "republic of korea"],
+  "Hong Kong": ["hongkong", "hk"],
+  Russia: ["russian federation"],
+  "Dominican Republic": ["dominican"],
+  "Puerto Rico": ["puerto"],
+  "Saudi Arabia": ["saudi", "ksa"],
+};
+
+// Pre-compute a lowercase search haystack per city code so the picker
+// filter is a single `.includes` test instead of rebuilding strings on
+// every keystroke. Includes code, city name, continent, country, and
+// any country aliases.
+const CITY_SEARCH_HAYSTACK: Record<string, string> = CITIES.reduce(
+  (acc, c) => {
+    const country = CITY_COUNTRY_BY_CODE[c.code] ?? "";
+    const aliases = COUNTRY_ALIASES[country] ?? [];
+    acc[c.code] = [c.code, c.name, c.regionName, country, ...aliases]
+      .join(" ")
+      .toLowerCase();
+    return acc;
+  },
+  {} as Record<string, string>,
+);
+
+/**
+ * Smart match for city pickers. Matches against airport code, city
+ * name, continent/region, country, and common country aliases — so
+ * "braz" → Brazil cities, "uae" → Dubai/Abu Dhabi, "korea" → Seoul.
+ * Multi-word queries match when EVERY whitespace-separated token is
+ * found (so "south korea" and "new york" both work).
+ */
+export function cityMatchesQuery(city: City, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  if (!q) return true;
+  const haystack = CITY_SEARCH_HAYSTACK[city.code] ?? city.name.toLowerCase();
+  return q.split(/\s+/).every((token) => haystack.includes(token));
+}
+
+/** Country for an airport code, or null if unmapped. */
+export function countryForCode(code: string): string | null {
+  return CITY_COUNTRY_BY_CODE[code] ?? null;
+}
