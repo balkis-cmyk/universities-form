@@ -9,7 +9,9 @@ import {
   computeAirlineValue,
   effectiveTravelIndex,
   fleetCount,
-  FUEL_BASELINE_USD_PER_L,
+  FUEL_TANK_SPECS,
+  cityQuarterlyBurnL,
+  cityFuelDiscounts,
 } from "@/lib/engine";
 import { cityEventImpact, activeNewsAtQuarter } from "@/lib/city-events";
 import { cn } from "@/lib/cn";
@@ -256,76 +258,104 @@ export function DashboardPanel() {
           <SnapCard label="Brand grade" value={grade.grade} sub={`Brand ${player.brandPts.toFixed(0)}/100 · Ops ${player.opsPts.toFixed(0)}/100`} color={grade.color} />
         </div>
 
-        {/* ── Fuel hedging card (Phase 1B) ──────────────────────
-            Shows ONLY when the player has installed at least one
-            fuel tank — otherwise it would read as dead UI. Surfaces
-            litres held / avg cost / unrealised P&L vs spot so the
-            player can see at a glance whether their hedge is in the
-            money. Catalogue copy promised this feature; the engine
-            consumes from storage at quarter close. */}
+        {/* ── Fuel tanks card (per-city redesign 2026-05) ───────
+            Shows ONLY when the player has installed tanks in at least
+            one city — otherwise it reads as dead UI. Surfaces total
+            tanks, blended network coverage % (how much of the network's
+            quarterly burn the tanks cover), and last quarter's realised
+            fuel-discount savings summed across routes. No litre
+            inventory — tanks never deplete; coverage is recomputed
+            against actual burn each quarter. Managed in Investments. */}
         {(() => {
-          const tanks = player.fuelTanks ?? { small: 0, medium: 0, large: 0 };
-          const totalTanks = (tanks.small ?? 0) + (tanks.medium ?? 0) + (tanks.large ?? 0);
-          if (totalTanks === 0) return null;
-          const capacityL =
-            (tanks.small ?? 0) * 25_000_000 +
-            (tanks.medium ?? 0) * 75_000_000 +
-            (tanks.large ?? 0) * 150_000_000;
-          const storedL = player.fuelStorageLevelL ?? 0;
-          const avgCost = player.fuelStorageAvgCostPerL ?? 0;
-          const fillPct = capacityL > 0 ? (storedL / capacityL) * 100 : 0;
-          const marketPricePerL = (fuelIndex / 100) * FUEL_BASELINE_USD_PER_L;
-          const unrealizedPnL = (marketPricePerL - avgCost) * storedL;
+          const byCity = player.fuelTanksByCity ?? {};
+          const cities = Object.entries(byCity).filter(([, c]) => c && c.count > 0);
+          if (cities.length === 0) return null;
+
+          const totalTanks = cities.reduce((sum, [, c]) => sum + c.count, 0);
+          const totalCapacityL = cities.reduce(
+            (sum, [, c]) => sum + FUEL_TANK_SPECS[c.tier].capacityL * c.count,
+            0,
+          );
+
+          // Blended coverage = Σ min(capacity, burn) / Σ burn across
+          // tank cities. Reflects how much of actual burn is covered.
+          const burnByCity = cityQuarterlyBurnL(player);
+          const discByCity = cityFuelDiscounts(player);
+          let coveredBurn = 0;
+          let totalBurn = 0;
+          for (const [code, c] of cities) {
+            const burn = burnByCity[code] ?? 0;
+            const cap = FUEL_TANK_SPECS[c.tier].capacityL * c.count;
+            totalBurn += burn;
+            coveredBurn += Math.min(cap, burn);
+          }
+          const blendedCoveragePct =
+            totalBurn > 0 ? (coveredBurn / totalBurn) * 100 : 100;
+          // Effective blended discount across tank cities (weighted by burn).
+          const blendedDiscountPct =
+            totalBurn > 0
+              ? (cities.reduce(
+                  (sum, [code]) => sum + (discByCity[code] ?? 0) * (burnByCity[code] ?? 0),
+                  0,
+                ) /
+                  totalBurn) *
+                100
+              : 0;
+
+          const lastQtrSavings = (player.routes ?? []).reduce(
+            (sum, r) => sum + (r.quarterlyFuelTankSavings ?? 0),
+            0,
+          );
+
           return (
             <div className="mt-3 rounded-md border border-line bg-surface p-3">
-              <div className="flex items-center gap-1.5 text-[0.625rem] uppercase tracking-wider text-ink-muted mb-2">
-                <Fuel size={12} />
-                Fuel hedging
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-1.5 text-[0.625rem] uppercase tracking-wider text-ink-muted">
+                  <Fuel size={12} />
+                  Fuel tanks
+                </div>
+                <span className="text-[0.625rem] text-ink-muted">
+                  Manage in Investments
+                </span>
               </div>
               <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-[0.75rem]">
                 <div>
+                  <div className="text-[0.625rem] text-ink-muted">Tanks</div>
+                  <div className="tabular font-mono text-ink font-medium">
+                    {totalTanks}
+                  </div>
+                  <div className="text-[0.625rem] text-ink-muted mt-0.5">
+                    across {cities.length} {cities.length === 1 ? "city" : "cities"}
+                  </div>
+                </div>
+                <div>
                   <div className="text-[0.625rem] text-ink-muted">Capacity</div>
                   <div className="tabular font-mono text-ink font-medium">
-                    {(capacityL / 1_000_000).toFixed(0)}M L
+                    {(totalCapacityL / 1_000_000).toFixed(0)}M L
                   </div>
                   <div className="text-[0.625rem] text-ink-muted mt-0.5">
-                    {totalTanks} tank{totalTanks === 1 ? "" : "s"}
+                    per quarter
                   </div>
                 </div>
                 <div>
-                  <div className="text-[0.625rem] text-ink-muted">Stored</div>
+                  <div className="text-[0.625rem] text-ink-muted">Coverage</div>
                   <div className="tabular font-mono text-ink font-medium">
-                    {(storedL / 1_000_000).toFixed(1)}M L
+                    {blendedCoveragePct.toFixed(0)}%
                   </div>
                   <div className="text-[0.625rem] text-ink-muted mt-0.5">
-                    {fillPct.toFixed(0)}% full
+                    {blendedDiscountPct.toFixed(1)}% blended discount
                   </div>
                 </div>
                 <div>
-                  <div className="text-[0.625rem] text-ink-muted">Avg cost</div>
-                  <div className="tabular font-mono text-ink font-medium">
-                    {avgCost > 0 ? `$${avgCost.toFixed(3)}/L` : "—"}
-                  </div>
-                  <div className="text-[0.625rem] text-ink-muted mt-0.5">
-                    Spot ${marketPricePerL.toFixed(3)}/L
-                  </div>
-                </div>
-                <div>
-                  <div className="text-[0.625rem] text-ink-muted">Unrealised P&amp;L</div>
+                  <div className="text-[0.625rem] text-ink-muted">Saved last qtr</div>
                   <div className={cn(
                     "tabular font-mono font-medium",
-                    storedL === 0
-                      ? "text-ink"
-                      : unrealizedPnL > 0
-                        ? "text-positive"
-                        : unrealizedPnL < 0
-                          ? "text-negative"
-                          : "text-ink",
+                    lastQtrSavings > 0 ? "text-positive" : "text-ink",
                   )}>
-                    {storedL === 0 ? "—" : `${unrealizedPnL >= 0 ? "+" : ""}${fmtMoney(unrealizedPnL)}`}
+                    {lastQtrSavings > 0 ? fmtMoney(lastQtrSavings) : "—"}
                   </div>
                   <div className="text-[0.625rem] text-ink-muted mt-0.5">
-                    vs current spot
+                    fuel discount
                   </div>
                 </div>
               </div>

@@ -37,6 +37,7 @@ import type {
   Team,
   CargoBellyTier,
   DoctrineId,
+  FuelTankTier,
 } from "@/types/game";
 import {
   SUBSIDIARY_TIER_REV_MULT,
@@ -93,10 +94,9 @@ function isDoctrine(team: { doctrine?: DoctrineId }, doctrine: ActiveDoctrineId)
  *    - Heathrow into-plane (post-handling fee): ~$0.90/L
  *    - $0.85 sits in the middle of the realistic band.
  *  Players REDUCE this via:
- *    - hub fuel reserve tank: −15% on routes from that hub
- *    - fuel-storage bulk-buy subsidiary: stored litres charged at the
- *      blended avg cost paid at purchase time (typically 25% below
- *      spot when prices spike)
+ *    - per-city fuel tanks: coverage-based discount (up to the tier max,
+ *      8/12/15%) on every route departing a city with installed tanks —
+ *      see FUEL_TANK_SPECS / cityFuelDiscounts
  *    - hedging flags: 100/fuelIndex multiplier
  *  So this constant is the UPPER bound; the engine consumes at this
  *  price minus any active discount stack.
@@ -124,6 +124,44 @@ export const FUEL_BASELINE_USD_PER_L = 0.85;
  *  pure industry % is closed by trimming non-fuel costs (slot, hub).
  */
 export const FUEL_BURN_REAL_WORLD_FACTOR = 2.5;
+
+/** Per-city fuel tank infrastructure spec (redesign 2026-05).
+ *
+ *  The player installs tanks PER CITY they operate in: pick a tier
+ *  (small/medium/large) and a count (1..10). Each tank carries a fixed
+ *  quarterly fuel COVERAGE capacity (litres). The discount applied to
+ *  every route departing that city is:
+ *
+ *    coverage = min(1, totalCityCapacityL / cityQuarterlyBurnL)
+ *    discount = tierMaxDiscount × coverage
+ *
+ *  Recomputed every quarter against ACTUAL burn — tanks never deplete,
+ *  there is no litre inventory and no spot-market timing game. Building
+ *  out coverage as a city's network grows keeps the discount near max.
+ *
+ *  Sizing rationale: a narrowbody (~3.0 L/km cruise) on a 1,500 km route
+ *  at 3 daily flights burns 3.0 × 2.5 × 1500 × 3 × 91 ≈ 3.07M L/quarter,
+ *  so an early-game city with 2-4 routes burns ~6-12M L/qtr. Per-tank
+ *  capacities are therefore single-digit millions so the 1..10 count
+ *  scales meaningfully. Tunable after play-test. */
+export const FUEL_TANK_SPECS: Record<
+  FuelTankTier,
+  {
+    capacityL: number;      // quarterly coverage litres per tank
+    maxDiscount: number;    // max fuel discount fraction at full coverage
+    installUsd: number;     // one-time install cost per tank
+    maintUsd: number;       // quarterly maintenance cost per tank
+    tier1Only: boolean;     // installable only at Tier-1 airports
+    label: string;
+  }
+> = {
+  small:  { capacityL: 2_000_000,  maxDiscount: 0.08, installUsd: 1_500_000, maintUsd: 120_000, tier1Only: false, label: "Small" },
+  medium: { capacityL: 5_000_000,  maxDiscount: 0.12, installUsd: 4_000_000, maintUsd: 300_000, tier1Only: false, label: "Medium" },
+  large:  { capacityL: 10_000_000, maxDiscount: 0.15, installUsd: 8_000_000, maintUsd: 550_000, tier1Only: true,  label: "Large" },
+};
+
+/** Maximum tank count per city. */
+export const FUEL_TANK_MAX_COUNT = 10;
 
 /** Discontinued-type maintenance escalation (master ref Update 5).
  *  Once an aircraft type passes its `cutoffRound`, every still-flying
@@ -1548,6 +1586,84 @@ export function odKey(a: string, b: string): string {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
+/** The set of cities an airline "operates in" — the union of its hub,
+ *  any secondary hubs, the origin of every active/pending route, and
+ *  every airport it leases slots at. Used to decide which cities can
+ *  host fuel tanks. Returns sorted, de-duplicated city codes. */
+export function operatedCities(team: Team): string[] {
+  const set = new Set<string>();
+  if (team.hubCode) set.add(team.hubCode);
+  for (const c of team.secondaryHubCodes ?? []) set.add(c);
+  for (const r of team.routes ?? []) {
+    if (r.status === "active" || r.status === "pending") set.add(r.originCode);
+  }
+  for (const code of Object.keys(team.airportLeases ?? {})) set.add(code);
+  return Array.from(set).filter((c) => !!CITIES_BY_CODE[c]).sort();
+}
+
+/** Quarterly fuel burn (litres) for a single route, independent of fuel
+ *  price, hedging, and any discount. Mirrors the per-flight burn math
+ *  inside computeRouteEconomics: average burn across the assigned ACTIVE
+ *  planes × daily frequency × quarter days. Used to size per-city tank
+ *  coverage at quarter close. */
+export function routeQuarterlyFuelBurnL(team: Team, route: Route): number {
+  const origin = CITIES_BY_CODE[route.originCode];
+  const dest = CITIES_BY_CODE[route.destCode];
+  if (!origin || !dest) return 0;
+  const distanceKm = route.distanceKm || haversineKm(origin, dest);
+  const planes = route.aircraftIds
+    .map((id) => team.fleet.find((f) => f.id === id))
+    .filter((x): x is FleetAircraft => !!x && x.status === "active");
+  if (planes.length === 0) return 0;
+  const burnSumPerFlight = planes.reduce((sum, p) => {
+    const spec = AIRCRAFT_BY_ID[p.specId];
+    if (!spec) return sum;
+    const fuelMult =
+      (p.ecoUpgrade ? 0.9 : 1.0) *
+      (p.engineUpgrade === "fuel" || p.engineUpgrade === "super" ? 0.9 : 1.0) *
+      (p.fuselageUpgrade ? 0.9 : 1.0);
+    return sum + spec.fuelBurnPerKm * FUEL_BURN_REAL_WORLD_FACTOR * fuelMult * distanceKm;
+  }, 0);
+  const burnPerFlight = burnSumPerFlight / planes.length;
+  return burnPerFlight * route.dailyFrequency * QUARTER_DAYS;
+}
+
+/** Per-city quarterly fuel burn (litres), summed across all ACTIVE routes
+ *  departing each city. */
+export function cityQuarterlyBurnL(team: Team): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const r of team.routes) {
+    if (r.status !== "active") continue;
+    const burn = routeQuarterlyFuelBurnL(team, r);
+    if (burn <= 0) continue;
+    out[r.originCode] = (out[r.originCode] ?? 0) + burn;
+  }
+  return out;
+}
+
+/** Per-city fuel discount fraction (0..tierMaxDiscount) delivered by the
+ *  installed tanks vs. that city's actual quarterly burn:
+ *    coverage = min(1, totalCapacityL / burnL)
+ *    discount = tierMaxDiscount × coverage
+ *  A city with tanks but no active-route burn yet clamps coverage to 1
+ *  (full tier max). Recomputed every quarter close so the discount tracks
+ *  the network as it grows — tanks never deplete. */
+export function cityFuelDiscounts(team: Team): Record<string, number> {
+  const tanks = team.fuelTanksByCity ?? {};
+  const burnByCity = cityQuarterlyBurnL(team);
+  const out: Record<string, number> = {};
+  for (const [code, cfg] of Object.entries(tanks)) {
+    if (!cfg || cfg.count <= 0) continue;
+    const spec = FUEL_TANK_SPECS[cfg.tier];
+    if (!spec) continue;
+    const capacityL = spec.capacityL * cfg.count;
+    const burnL = burnByCity[code] ?? 0;
+    const coverage = burnL > 0 ? Math.min(1, capacityL / burnL) : 1;
+    out[code] = spec.maxDiscount * coverage;
+  }
+  return out;
+}
+
 export function computeRouteEconomics(
   team: Team,
   route: Route,
@@ -1558,6 +1674,10 @@ export function computeRouteEconomics(
   olympicHostCode?: string | null,
   cargoPool?: CargoPoolContext,
   totalRounds: number = 60,
+  /** Per-city fuel discount fraction (0..maxDiscount), keyed by city code.
+   *  Precomputed once per quarter-close in runQuarterClose against actual
+   *  network burn. UI preview callers pass nothing → no discount (0). */
+  cityFuelDiscount?: Record<string, number>,
 ): RouteEconomics {
   const origin = CITIES_BY_CODE[route.originCode];
   const dest = CITIES_BY_CODE[route.destCode];
@@ -1739,16 +1859,12 @@ export function computeRouteEconomics(
     }, 0);
     const totalFuelBurnPerFlight =
       planes.length > 0 ? fuelBurnSumPerFlight / planes.length : 0;
-    // Fuel-tank discount on cargo routes too — mirrors the passenger
-    // path. Phase 1B: raised 0.95 → 0.85 (5% → 15% off spot index) to
-    // honor the subsidiary catalogue copy in src/data/subsidiaries.ts:89
-    // ("...and a 15% fuel discount on routes from this city"). The 25%
-    // bulk-buy discount stacks on top via the runQuarterClose storage-
-    // consumption swap; this routing discount applies to whatever
-    // wasn't covered by storage at quarter close.
-    const cargoHasFuelTank =
-      team.hubInvestments?.fuelReserveTankHubs?.includes(route.originCode);
-    const cargoFuelTankDiscount = cargoHasFuelTank ? 0.85 : 1.0;
+    // Per-city fuel tank coverage discount on cargo routes too — mirrors
+    // the passenger path. Coverage-based discount precomputed per quarter
+    // close (cityFuelDiscounts) and passed via `cityFuelDiscount`. UI
+    // preview callers pass no map → 0 discount.
+    const cargoCityDiscountFrac = cityFuelDiscount?.[route.originCode] ?? 0;
+    const cargoFuelTankDiscount = 1 - cargoCityDiscountFrac;
     const cargoFuelBaselineCost =
       totalFuelBurnPerFlight * fuelPricePerL * route.dailyFrequency * QUARTER_DAYS;
     const quarterlyFuelCost = cargoFuelBaselineCost * cargoFuelTankDiscount;
@@ -2169,19 +2285,15 @@ export function computeRouteEconomics(
       : team.flags.has("hedged_50_50")
         ? (100 / fuelIndex + 1) / 2
         : 1;
-  // Fuel reserve tank at the origin hub: 15% fuel discount on routes
-  // from there (Phase 1B raised from 5% → 15% to honor the subsidiary
-  // catalogue copy in src/data/subsidiaries.ts:89 "...and a 15% fuel
-  // discount on routes from this city"). The 25% bulk-buy discount
-  // stacks on top via runQuarterClose's storage-consumption swap; this
-  // routing discount applies to whatever wasn't covered by storage at
-  // quarter close. Compute the un-discounted cost first so the route
+  // Per-city fuel tanks (redesign 2026-05): the origin city's installed
+  // tanks deliver a COVERAGE-based discount on every route departing it:
+  //   discount = tierMaxDiscount × min(1, cityCapacityL / cityBurnL)
+  // computed once per quarter-close (cityFuelDiscounts) and passed in via
+  // `cityFuelDiscount`. Compute the un-discounted cost first so the route
   // detail modal can show the savings explicitly ("Fuel $1.8M (saved
-  // $0.4M via hub fuel tank)") rather than have the player guess what
-  // the discount delivered.
-  const hasFuelTank =
-    team.hubInvestments?.fuelReserveTankHubs?.includes(route.originCode);
-  const fuelTankDiscount = hasFuelTank ? 0.85 : 1.0;
+  // $0.4M via city fuel tanks)"). UI preview callers pass no map → 0.
+  const cityDiscountFrac = cityFuelDiscount?.[route.originCode] ?? 0;
+  const fuelTankDiscount = 1 - cityDiscountFrac;
   const fuelBaselineCost =
     totalFuelBurnPerFlight * fuelPricePerL *
     route.dailyFrequency * QUARTER_DAYS * hedge;
@@ -2884,8 +2996,6 @@ export interface QuarterCloseResult {
   newLabourRelationsScore: number;
   newMilestones: string[];
   newTaxLossCarryForward: Team["taxLossCarryForward"];
-  newFuelStorageLevelL: number;
-  newFuelStorageAvgCostPerL: number;
   newSubsidiaries: Team["subsidiaries"];
   /** Pre-close team metrics so the digest can show deltas without bookkeeping. */
   prevCashUsd: number;
@@ -3119,6 +3229,14 @@ export function runQuarterClose(
     }
   }
 
+  // Per-city fuel tank coverage discount, precomputed once against the
+  // network's actual quarterly burn (redesign 2026-05). Each operated
+  // city's installed tanks deliver tierMaxDiscount × min(1, capacity/burn)
+  // on every route departing it; recomputed each quarter so the discount
+  // scales with the network and never "depletes". Passed into the econ
+  // call below so both passenger + cargo fuel paths read the same map.
+  const cityFuelDiscountMap = cityFuelDiscounts(next);
+
   for (const r of next.routes) {
     if (r.status === "active") {
       // Route Legacy Bonus (PRD E8.1) — +12% after 4+ consecutive active quarters
@@ -3129,7 +3247,7 @@ export function runQuarterClose(
       const econ = computeRouteEconomics(
         next, r, ctx.quarter, ctx.fuelIndex, ctx.rivals,
         ctx.worldCupHostCode, ctx.olympicHostCode, cargoPool,
-        ctx.totalRounds,
+        ctx.totalRounds, cityFuelDiscountMap,
       );
       const boostedRevenue = econ.quarterlyRevenue * legacyBonus * firstMoverBonus;
       revenue += boostedRevenue;
@@ -3342,48 +3460,20 @@ export function runQuarterClose(
     );
   }
 
-  // ─ Hub Investments: Fuel Reserve Tank (Phase 1B note) ───────────
-  // The legacy team-level −15% fuel-savings block lived here. It was
-  // a duplicate of the per-route discount applied inside
-  // computeRouteEconomics (the `fuelTankDiscount` factor on the
-  // origin-side), AND it incorrectly counted destCode matches as
-  // depot-discounted (the catalogue copy is "...from this city",
-  // origin-only). Pre-Phase-1B that stacked into a ~19% effective
-  // discount; post-Phase-1B it would have stacked into ~27%. Both
-  // contradict the "15%" catalogue promise.
-  //
-  // The per-route discount in computeRouteEconomics now delivers the
-  // catalogue's 15% exactly (origin-only, applied to the spot price
-  // before storage swap). The fuel-storage block below still runs
-  // and provides the additional 25% bulk-buy savings on whatever
-  // litres the player pre-stocked. Net behaviour: 15% baseline
-  // routing discount + bulk-buy discount on stored fuel = clean
-  // delivery of both halves of the subsidiary catalogue copy.
-
-  // ─ Fuel Storage reconciliation (PRD E2) ────────────────
-  // Route economics computed fuel at market; draw from storage first if any.
-  if ((next.fuelStorageLevelL ?? 0) > 0 && fuelCost > 0) {
-    const marketPricePerL = (ctx.fuelIndex / 100) * FUEL_BASELINE_USD_PER_L;
-    if (marketPricePerL > 0) {
-      const litresBurned = fuelCost / marketPricePerL;
-      const fromStorage = Math.min(next.fuelStorageLevelL, litresBurned);
-      const fromMarket = litresBurned - fromStorage;
-      const storageCostUsed = fromStorage * next.fuelStorageAvgCostPerL;
-      const marketCost = fromMarket * marketPricePerL;
-      const savings = fuelCost - (storageCostUsed + marketCost);
-      fuelCost = storageCostUsed + marketCost;
-      next.fuelStorageLevelL = next.fuelStorageLevelL - fromStorage;
-      if (next.fuelStorageLevelL === 0) next.fuelStorageAvgCostPerL = 0;
-      if (savings > 0)
-        notes.push(`Fuel storage saved $${(savings / 1e6).toFixed(1)}M this quarter`);
-    }
-  }
-
-  // ─ Fuel tank maintenance (PRD E2) ──────────────────────
-  const fuelTankMaint =
-    (next.fuelTanks?.small ?? 0) * 150_000 +
-    (next.fuelTanks?.medium ?? 0) * 350_000 +
-    (next.fuelTanks?.large ?? 0) * 600_000;
+  // ─ Per-city fuel tanks (redesign 2026-05) ───────────────────────
+  // The fuel discount itself is applied inside computeRouteEconomics via
+  // the coverage-based `cityFuelDiscountMap` (no litre inventory, no
+  // storage swap, no bulk-buy reconciliation). All that remains here is
+  // the quarterly maintenance on the installed tanks: Σ count × maintUsd
+  // across every city that has tanks. Folded into maintenanceCost below.
+  const fuelTankMaint = Object.values(next.fuelTanksByCity ?? {}).reduce(
+    (sum, cfg) => {
+      if (!cfg || cfg.count <= 0) return sum;
+      const spec = FUEL_TANK_SPECS[cfg.tier];
+      return spec ? sum + cfg.count * spec.maintUsd : sum;
+    },
+    0,
+  );
 
   // ─ Staff (A3) ───────────────────────────────────────────
   const staffBase = baselineStaffCostUsd(next);
@@ -4367,8 +4457,6 @@ export function runQuarterClose(
     newLabourRelationsScore: next.labourRelationsScore,
     newMilestones: next.milestones ?? [],
     newTaxLossCarryForward: next.taxLossCarryForward,
-    newFuelStorageLevelL: next.fuelStorageLevelL,
-    newFuelStorageAvgCostPerL: next.fuelStorageAvgCostPerL,
     newSubsidiaries: next.subsidiaries,
     prevCashUsd,
     prevBrandPts,

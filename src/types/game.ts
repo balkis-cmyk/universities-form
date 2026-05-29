@@ -429,6 +429,11 @@ export interface TeamMember {
   cards: string[];                     // "Integrity Leader", "Maverick", etc.
 }
 
+/** Fuel tank tier. Larger tiers carry more litres of quarterly coverage
+ *  and a higher max discount, but cost more to install + maintain.
+ *  "large" is only installable at Tier-1 airports. */
+export type FuelTankTier = "small" | "medium" | "large";
+
 export interface Team {
   id: string;
   name: string;                  // airline name
@@ -626,10 +631,18 @@ export interface Team {
   // Insurance policy (PRD E5)
   insurancePolicy: InsurancePolicy;
 
-  // Fuel Storage (PRD E2) — litres capacity + current stored + avg cost
-  fuelTanks: { small: number; medium: number; large: number };
-  fuelStorageLevelL: number;
-  fuelStorageAvgCostPerL: number;
+  // Fuel tanks — per-city infrastructure (redesign 2026-05).
+  // For each operated city the airline picks a tier + count (1..10).
+  // Capacity = perTankCapacity(tier) × count gives a coverage-based
+  // fuel discount on routes departing that city. No litre inventory,
+  // no bulk-buy, no depletion — recomputed each quarter vs actual burn.
+  fuelTanksByCity: Record<string, { tier: FuelTankTier; count: number }>;
+
+  // LEGACY fuel-storage fields (pre-redesign). Kept OPTIONAL so existing
+  // saves hydrate without crashing; no longer written or read.
+  fuelTanks?: { small: number; medium: number; large: number };
+  fuelStorageLevelL?: number;
+  fuelStorageAvgCostPerL?: number;
 
   // Slots held at each airport (PRD G10).
   // LEGACY field — Model A interpretation (one-time auction price). Kept

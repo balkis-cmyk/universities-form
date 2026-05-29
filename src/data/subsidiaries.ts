@@ -93,16 +93,6 @@ export const SUBSIDIARY_CATALOG: SubsidiaryCatalogEntry[] = [
     icon: "Wrench",
   },
   {
-    type: "fuel-storage",
-    name: "Fuel Reserve Depot",
-    description: "Bulk Jet A1 storage at the city. Unlocks bulk-buy 25% off market fuel and a 15% fuel discount on routes from this city.",
-    pitch: "Hedge fuel volatility and capture below-market pricing.",
-    setupCostUsd: 20_000_000,
-    revenuePerQuarterUsd: 0,
-    operationalBonus: "Bulk fuel @ 25% off + 15% fuel discount on routes from here",
-    icon: "Fuel",
-  },
-  {
     type: "catering",
     name: "Catering Kitchen",
     description: "Owned in-flight catering at the city. Drops third-party markups, lifts perceived service quality, gives every route through this city a small demand pull.",

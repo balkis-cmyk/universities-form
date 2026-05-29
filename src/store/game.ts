@@ -49,7 +49,7 @@ import {
   loadSnapshot as snapLoad,
   deleteSnapshot as snapDelete,
 } from "@/lib/snapshots";
-import { FUEL_BASELINE_USD_PER_L, effectiveBaseRatePct, effectiveRangeKm, effectiveTravelIndex, effectiveUnlockQuarter, newsFuelIndexHint } from "@/lib/engine";
+import { FUEL_TANK_SPECS, FUEL_TANK_MAX_COUNT, operatedCities, effectiveBaseRatePct, effectiveRangeKm, effectiveTravelIndex, effectiveUnlockQuarter, newsFuelIndexHint } from "@/lib/engine";
 import {
   totalUpgradeCostPerPlaneUsd,
   amenityCostUsd,
@@ -108,6 +108,7 @@ import type {
   DeferredEvent,
   DoctrineId,
   FleetAircraft,
+  FuelTankTier,
   GameState,
   LoanInstrument,
   PreOrder,
@@ -613,10 +614,20 @@ export interface GameStore extends GameState {
   /** Set the player team's insurance policy (PRD E5). */
   setInsurancePolicy(policy: "none" | "low" | "medium" | "high"): void;
 
-  /** Fuel Storage (PRD E2) */
-  buyFuelTank(size: "small" | "medium" | "large"): { ok: boolean; error?: string };
-  buyBulkFuel(litres: number): { ok: boolean; error?: string };
-  sellStoredFuel(litres: number): { ok: boolean; error?: string };
+  /** Per-city fuel tanks (redesign 2026-05). Set tier + count (1..10) for
+   *  one operated city; count 0 / tier "none" removes the entry. Large is
+   *  Tier-1 airports only. Charges install cost on incremental tanks. */
+  setCityFuelTanks(
+    cityCode: string,
+    tier: FuelTankTier | "none",
+    count: number,
+  ): { ok: boolean; error?: string };
+  /** Apply a tier + count across every operated city in one action
+   *  (skips Large at non-Tier-1 cities). */
+  applyCityFuelTanksToAll(
+    tier: FuelTankTier | "none",
+    count: number,
+  ): { ok: boolean; error?: string; applied: number; skipped: number };
 
   /** Slot auction (PRD G10) */
   submitSlotBid(airportCode: string, slots: number, pricePerSlot: number):
@@ -1035,9 +1046,8 @@ function makeStartingTeam(args: {
     rcfBalanceUsd: 0,
     taxLossCarryForward: [],
     insurancePolicy: "medium",
-    fuelTanks: { small: 0, medium: 0, large: 0 },
-    fuelStorageLevelL: 0,
-    fuelStorageAvgCostPerL: 0,
+    // Fuel tanks — per-city infrastructure (redesign 2026-05).
+    fuelTanksByCity: {},
     // PRD G10 — each team starts with 50 slots at their hub (free,
     // grandfathered baked into the hub terminal fee). Legacy field
     // kept for save migration; airportLeases is the active bookkeeping
@@ -4680,8 +4690,6 @@ export const useGame = create<GameStore>()(
           labourRelationsScore: result.newLabourRelationsScore,
           milestones: result.newMilestones,
           taxLossCarryForward: result.newTaxLossCarryForward,
-          fuelStorageLevelL: result.newFuelStorageLevelL,
-          fuelStorageAvgCostPerL: result.newFuelStorageAvgCostPerL,
           subsidiaries: result.newSubsidiaries,
           // Dedupe-on-push: drop any existing row for this quarter
           // before appending the fresh one. Earlier the array could
@@ -4895,7 +4903,6 @@ export const useGame = create<GameStore>()(
                       { type: "hotel", weight: 3 },
                       { type: "limo", weight: 2 },
                       { type: "maintenance-hub", weight: 1 },
-                      { type: "fuel-storage", weight: 1 },
                       { type: "catering", weight: 1 },
                     ]
                   : [
@@ -4904,7 +4911,6 @@ export const useGame = create<GameStore>()(
                       { type: "limo", weight: 2 },
                       { type: "catering", weight: 1 },
                       { type: "maintenance-hub", weight: 1 },
-                      { type: "fuel-storage", weight: 1 },
                       { type: "training-academy", weight: 1 },
                     ];
               const totalWeight = preferredTypes.reduce((s, x) => s + x.weight, 0);
@@ -4936,20 +4942,10 @@ export const useGame = create<GameStore>()(
                   subsidiaries: [...(updated.subsidiaries ?? []), newSub],
                 };
                 // Side-effect: maintain the legacy hubInvestments
-                // for engine bonuses that read from there (fuel tank,
-                // maintenance depot, premium lounge).
-                if (chosenType === "fuel-storage") {
-                  const arr = updated.hubInvestments?.fuelReserveTankHubs ?? [];
-                  if (!arr.includes(chosenCity)) {
-                    updated = {
-                      ...updated,
-                      hubInvestments: {
-                        ...updated.hubInvestments,
-                        fuelReserveTankHubs: [...arr, chosenCity],
-                      },
-                    };
-                  }
-                } else if (chosenType === "maintenance-hub") {
+                // for engine bonuses that read from there (maintenance
+                // depot, premium lounge). Fuel benefit was removed in the
+                // 2026-05 per-city fuel-tank redesign.
+                if (chosenType === "maintenance-hub") {
                   const arr = updated.hubInvestments?.maintenanceDepotHubs ?? [];
                   if (!arr.includes(chosenCity)) {
                     updated = {
@@ -6678,9 +6674,7 @@ export const useGame = create<GameStore>()(
           opsPts: 50,
           customerLoyaltyPct: 50,
           brandValue: 50,
-          fuelTanks: { small: 0, medium: 0, large: 0 },
-          fuelStorageLevelL: 0,
-          fuelStorageAvgCostPerL: 0,
+          fuelTanksByCity: {},
           slotsByAirport: { [hubCode]: 50 },
           airportLeases: { [hubCode]: { slots: 50, totalWeeklyCost: 0 } },
           pendingSlotBids: [],
@@ -7362,7 +7356,11 @@ export const useGame = create<GameStore>()(
                 premiumLoungeHubs: [],
                 opsExpansionSlots: 0,
               },
-              fuelTanks: t.fuelTanks ?? { small: 0, medium: 0, large: 0 },
+              // Fuel-tank redesign migration (2026-05): default the new
+              // per-city tank map to {} for any pre-redesign save so the
+              // engine + UI can read it without a crash. Legacy team-level
+              // fuelTanks/fuelStorage* fields are left untouched (inert).
+              fuelTanksByCity: t.fuelTanksByCity ?? {},
               // Insurance migration (v2.1.1): teams seeded under the
               // old "none" default land on Financials with $0 insurance,
               // which workshop participants reject as unrealistic. Bump
@@ -7893,107 +7891,132 @@ export const useGame = create<GameStore>()(
         set({ sessionLocked: locked });
       },
 
-      // ── Fuel Storage (PRD E2) ──────────────────────────────
-      buyFuelTank: (size) => {
+      // ── Per-city fuel tanks (redesign 2026-05) ─────────────
+      setCityFuelTanks: (cityCode, tier, count) => {
         const s = get();
         const player = s.teams.find((t) => t.id === s.playerTeamId);
         if (!player) return { ok: false, error: "No player" };
-        if (typeof size !== "string" || !["small", "medium", "large"].includes(size))
-          return { ok: false, error: "Invalid tank size" };
-        const specs = {
-          small:  { cost: 3_000_000,  capacity: 25_000_000 },
-          medium: { cost: 8_000_000,  capacity: 75_000_000 },
-          large:  { cost: 15_000_000, capacity: 150_000_000 },
-        } as const;
-        const spec = specs[size as "small" | "medium" | "large"];
-        if (player.cashUsd < spec.cost)
-          return { ok: false, error: `Need ${fmtMoneyPlain(spec.cost)}` };
-        const currentCapL =
-          player.fuelTanks.small * specs.small.capacity +
-          player.fuelTanks.medium * specs.medium.capacity +
-          player.fuelTanks.large * specs.large.capacity;
-        if (currentCapL + spec.capacity > 300_000_000)
-          return { ok: false, error: "300M L maximum storage reached" };
+
+        const city = CITIES_BY_CODE[cityCode];
+        if (!city) return { ok: false, error: "Unknown city" };
+        if (!operatedCities(player).includes(cityCode))
+          return { ok: false, error: "You don't operate in this city yet" };
+
+        const existing = player.fuelTanksByCity?.[cityCode];
+
+        // Remove tanks (tier "none" or count 0). No refund.
+        if (tier === "none" || count <= 0) {
+          if (!existing) return { ok: true };
+          set({
+            teams: s.teams.map((t) => {
+              if (t.id !== player.id) return t;
+              const map = { ...(t.fuelTanksByCity ?? {}) };
+              delete map[cityCode];
+              return { ...t, fuelTanksByCity: map };
+            }),
+          });
+          toast.info("Fuel tanks removed", `${city.name} (${cityCode}) — no more tanks`);
+          void get().pushStateToServer("player.setCityFuelTanks", { cityCode, tier: "none", count: 0 });
+          return { ok: true };
+        }
+
+        if (!["small", "medium", "large"].includes(tier))
+          return { ok: false, error: "Invalid tank tier" };
+        const clamped = Math.max(1, Math.min(FUEL_TANK_MAX_COUNT, Math.floor(count)));
+        const spec = FUEL_TANK_SPECS[tier as FuelTankTier];
+
+        // Large tanks only at Tier-1 airports.
+        if (spec.tier1Only && city.tier !== 1)
+          return { ok: false, error: `${spec.label} tanks require a Tier-1 airport` };
+
+        // Charge install only on the incremental tanks at the chosen tier.
+        // Changing tier re-charges install on the new tier's tanks.
+        const prevSameTier = existing && existing.tier === tier ? existing.count : 0;
+        const incremental = Math.max(0, clamped - prevSameTier);
+        const cost = spec.installUsd * incremental;
+        if (cost > player.cashUsd)
+          return { ok: false, error: `Need $${(cost / 1_000_000).toFixed(1)}M to install` };
+
         set({
-          teams: s.teams.map((t) => t.id !== player.id ? t : {
-            ...t,
-            cashUsd: t.cashUsd - spec.cost,
-            fuelTanks: { ...t.fuelTanks, [size]: t.fuelTanks[size] + 1 },
+          teams: s.teams.map((t) => {
+            if (t.id !== player.id) return t;
+            const map = { ...(t.fuelTanksByCity ?? {}) };
+            map[cityCode] = { tier: tier as FuelTankTier, count: clamped };
+            return { ...t, cashUsd: t.cashUsd - cost, fuelTanksByCity: map };
           }),
         });
-        toast.success(`${size[0].toUpperCase() + size.slice(1)} fuel tank installed`,
-          `+${(spec.capacity / 1_000_000).toFixed(0)}M litres capacity · $${(spec.cost / 1_000_000).toFixed(1)}M`);
+        const capacityM = (spec.capacityL * clamped) / 1_000_000;
+        toast.success(
+          `${spec.label} tanks · ${city.name} (${cityCode})`,
+          `${clamped}× tank${clamped > 1 ? "s" : ""} · ${capacityM.toFixed(0)}M L/qtr coverage` +
+            (cost > 0 ? ` · −$${(cost / 1_000_000).toFixed(1)}M install` : ""),
+        );
+        void get().pushStateToServer("player.setCityFuelTanks", { cityCode, tier, count: clamped });
         return { ok: true };
       },
 
-      buyBulkFuel: (litres) => {
+      applyCityFuelTanksToAll: (tier, count) => {
         const s = get();
         const player = s.teams.find((t) => t.id === s.playerTeamId);
-        if (!player) return { ok: false, error: "No player" };
-        if (typeof litres !== "number" || !Number.isFinite(litres) || litres <= 0)
-          return { ok: false, error: "Invalid litres amount" };
-        const specs = {
-          small: { capacity: 25_000_000 },
-          medium: { capacity: 75_000_000 },
-          large: { capacity: 150_000_000 },
-        };
-        const capL =
-          player.fuelTanks.small * specs.small.capacity +
-          player.fuelTanks.medium * specs.medium.capacity +
-          player.fuelTanks.large * specs.large.capacity;
-        const room = capL - player.fuelStorageLevelL;
-        if (litres > room) return { ok: false, error: `Only ${(room / 1_000_000).toFixed(1)}M L free` };
-        const bulkPrice = (s.fuelIndex / 100) * FUEL_BASELINE_USD_PER_L * 0.75; // 25% discount
-        const cost = litres * bulkPrice;
-        if (player.cashUsd < cost) return { ok: false, error: `Need $${(cost / 1_000_000).toFixed(1)}M` };
-        const newTotal = player.fuelStorageLevelL + litres;
-        const newAvgCost =
-          newTotal > 0
-            ? (player.fuelStorageLevelL * player.fuelStorageAvgCostPerL + litres * bulkPrice) /
-              newTotal
-            : 0;
-        set({
-          teams: s.teams.map((t) => t.id !== player.id ? t : {
-            ...t,
-            cashUsd: t.cashUsd - cost,
-            fuelStorageLevelL: newTotal,
-            fuelStorageAvgCostPerL: newAvgCost,
-          }),
-        });
-        toast.success(`Bulk fuel purchased`,
-          `${(litres / 1_000_000).toFixed(1)}M L @ $${bulkPrice.toFixed(3)}/L (25% off market)`);
-        return { ok: true };
-      },
+        if (!player) return { ok: false, error: "No player", applied: 0, skipped: 0 };
 
-      sellStoredFuel: (litres) => {
-        const s = get();
-        const player = s.teams.find((t) => t.id === s.playerTeamId);
-        if (!player) return { ok: false, error: "No player" };
-        if (typeof litres !== "number" || !Number.isFinite(litres) || litres <= 0)
-          return { ok: false, error: "Invalid litres amount" };
-        if (litres > player.fuelStorageLevelL)
-          return { ok: false, error: `Only ${(player.fuelStorageLevelL / 1_000_000).toFixed(1)}M L in storage` };
-        // Sell price: 65% of current spot (vs buy at 75% of spot).
-        // 10% spread between bid and ask CLOSES the riskless-arbitrage
-        // loop that buying and selling at the same 0.75× created when
-        // the index didn't move. Player still profits handsomely on
-        // real spikes (buy at 0.75 × 0.85 × index 80 = $0.51/L; sell
-        // at 0.65 × 0.85 × index 130 = $0.72/L → 41% gain), but
-        // can't churn flat markets for free cash.
-        const sellPrice = (s.fuelIndex / 100) * FUEL_BASELINE_USD_PER_L * 0.65;
-        const proceeds = litres * sellPrice;
-        const newTotal = player.fuelStorageLevelL - litres;
+        const cities = operatedCities(player);
+        if (cities.length === 0)
+          return { ok: false, error: "No operated cities yet", applied: 0, skipped: 0 };
+
+        // Remove-all path.
+        if (tier === "none" || count <= 0) {
+          set({
+            teams: s.teams.map((t) =>
+              t.id !== player.id ? t : { ...t, fuelTanksByCity: {} },
+            ),
+          });
+          toast.info("Fuel tanks cleared", `Removed tanks from all ${cities.length} cities`);
+          void get().pushStateToServer("player.applyCityFuelTanksToAll", { tier: "none", count: 0 });
+          return { ok: true, applied: cities.length, skipped: 0 };
+        }
+
+        if (!["small", "medium", "large"].includes(tier))
+          return { ok: false, error: "Invalid tank tier", applied: 0, skipped: 0 };
+        const clamped = Math.max(1, Math.min(FUEL_TANK_MAX_COUNT, Math.floor(count)));
+        const spec = FUEL_TANK_SPECS[tier as FuelTankTier];
+
+        // Eligible cities: Large skips non-Tier-1 cities.
+        const eligible = cities.filter(
+          (c) => !spec.tier1Only || CITIES_BY_CODE[c]?.tier === 1,
+        );
+        const skipped = cities.length - eligible.length;
+
+        // Total install cost across incremental tanks per city.
+        let totalCost = 0;
+        for (const c of eligible) {
+          const existing = player.fuelTanksByCity?.[c];
+          const prevSameTier = existing && existing.tier === tier ? existing.count : 0;
+          totalCost += spec.installUsd * Math.max(0, clamped - prevSameTier);
+        }
+        if (totalCost > player.cashUsd)
+          return {
+            ok: false,
+            error: `Need $${(totalCost / 1_000_000).toFixed(1)}M to install across ${eligible.length} cities`,
+            applied: 0,
+            skipped,
+          };
+
         set({
-          teams: s.teams.map((t) => t.id !== player.id ? t : {
-            ...t,
-            cashUsd: t.cashUsd + proceeds,
-            fuelStorageLevelL: newTotal,
-            fuelStorageAvgCostPerL: newTotal > 0 ? t.fuelStorageAvgCostPerL : 0,
+          teams: s.teams.map((t) => {
+            if (t.id !== player.id) return t;
+            const map = { ...(t.fuelTanksByCity ?? {}) };
+            for (const c of eligible) map[c] = { tier: tier as FuelTankTier, count: clamped };
+            return { ...t, cashUsd: t.cashUsd - totalCost, fuelTanksByCity: map };
           }),
         });
-        toast.info("Sold stored fuel",
-          `${(litres / 1_000_000).toFixed(1)}M L @ $${sellPrice.toFixed(3)}/L → $${(proceeds / 1_000_000).toFixed(1)}M proceeds`);
-        return { ok: true };
+        toast.success(
+          `${spec.label} tanks across ${eligible.length} cities`,
+          `${clamped}× each · −$${(totalCost / 1_000_000).toFixed(1)}M install` +
+            (skipped > 0 ? ` · ${skipped} non-Tier-1 city skipped` : ""),
+        );
+        void get().pushStateToServer("player.applyCityFuelTanksToAll", { tier, count: clamped });
+        return { ok: true, applied: eligible.length, skipped };
       },
 
       // ── Hub infrastructure (PRD D4) ────────────────────────
