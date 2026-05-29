@@ -333,6 +333,10 @@ export async function createGame(args: CreateGameArgs): Promise<
         label: s.label,
       })),
       seats: [],
+      // Airport Ownership & Hub System V2 — enabled for all NEW games
+      // ("one big push"). In-flight V1 saves never set this flag, so they
+      // keep the legacy buy/expand/sell flow untouched.
+      airportSystemV2: true,
       startedAt: null,
       createdAt: Date.now(),
       updatedAt: Date.now(),

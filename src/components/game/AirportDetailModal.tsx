@@ -20,6 +20,7 @@ import {
 } from "@/lib/airport-ownership";
 import { cityEffectiveDemand } from "@/lib/engine";
 import { cityEventImpact } from "@/lib/city-events";
+import { AirportOwnershipV2 } from "@/components/game/AirportOwnershipV2";
 
 /**
  * Airport detail popup — opened when the player double-clicks a city on
@@ -291,8 +292,13 @@ export function AirportDetailModal({
           );
         })()}
 
-        {/* Airport ownership panel (Sprint 10) */}
-        <AirportOwnership cityCode={city.code} />
+        {/* Airport ownership panel — V2 (auctions/approvals/owner console) for
+            new games, else the legacy buy/expand/sell flow. */}
+        {s.session?.airportSystemV2 ? (
+          <AirportOwnershipV2 cityCode={city.code} />
+        ) : (
+          <AirportOwnership cityCode={city.code} />
+        )}
       </ModalBody>
 
       <ModalFooter>
