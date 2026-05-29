@@ -1,3 +1,14 @@
+// V2 airport-system string unions live in the spec layer
+// (`src/lib/airport-system-v2.ts`) so the constants and the types stay in
+// one place. These are TYPE-ONLY imports — fully erased at compile time —
+// so the reciprocal `import type { CityTier, DoctrineId }` inside that
+// module forms a harmless type-only cycle with no runtime dependency.
+import type {
+  AirportSpecialization,
+  AirportSpecializationFork,
+  AirportDemandType,
+} from "@/lib/airport-system-v2";
+
 // ─── Cities ────────────────────────────────────────────────
 export type Region = "na" | "sa" | "la" | "eu" | "me" | "mea" | "af" | "as" | "oc";
 export type CityTier = 1 | 2 | 3 | 4;
@@ -442,6 +453,13 @@ export interface Team {
   hubCode: string;
   secondaryHubCodes: string[];   // additional hubs added after Q3 at 2× fee
   doctrine: DoctrineId;
+
+  /** V2 ONLY (session.airportSystemV2). Denormalized list of airport
+   *  codes this airline owns outright — the authoritative ownership flag
+   *  remains `airportSlots[code].ownerTeamId`, but this mirror lets the UI
+   *  and bots enumerate a team's airports without scanning every airport.
+   *  Undefined/empty on V1 games. */
+  ownedAirportCodes?: string[];
 
   /** Single source of truth for who runs this team:
    *    - "human" — a real player owns this seat (or it's an open seat in
@@ -893,6 +911,12 @@ export interface GameSession {
    *  and aircraft unlocks reuse with a +60 offset. Defaults to "half"
    *  for back-compat with persisted sessions. */
   campaignMode?: "half" | "full";
+  /** Gates the redesigned Airport Ownership & Hub System (V2). Set true
+   *  ONLY for games created after V2 ships; in-flight games and every
+   *  persisted save leave this undefined/false and keep the V1 airport
+   *  system untouched. Every engine/store/UI branch that implements V2
+   *  behaviour checks this flag first, so legacy workshops are unaffected. */
+  airportSystemV2?: boolean;
   joinCode: string | null;
   locked: boolean;
   maxTeams: number;
@@ -1020,6 +1044,17 @@ export interface GameState {
    *  rejects (or 2 quarters pass and it auto-expires). Approved bids
    *  transfer ownership; rejected/expired bids refund the held cash. */
   airportBids?: AirportBid[];
+
+  /** V2 ONLY (session.airportSystemV2). Active + historical privatization
+   *  auctions the government has announced. Bidding, adjudication, and
+   *  the resulting approval gauntlet are driven from here. Undefined on
+   *  every V1 game. */
+  airportAuctions?: AirportAuction[];
+
+  /** V2 ONLY. In-progress approval gauntlets — one per won auction that
+   *  has not yet closed (or collapsed). The engine resolves these at the
+   *  deadline round. Undefined on every V1 game. */
+  airportApprovals?: AirportApprovalProcess[];
 
   /** City code that hosts the World Cup (rounds 19-24 window). Picked
    *  once at game init from tier 1-2 cities that are NOT a hub of any
@@ -1261,6 +1296,102 @@ export interface PreOrder {
   deliveredAircraftId?: string;
 }
 
+// ════════════════════════════════════════════════════════════════════
+//  V2 AIRPORT SYSTEM — state shapes (session.airportSystemV2 only)
+//  Constants + pure logic live in src/lib/airport-system-v2.ts. These
+//  interfaces persist on AirportSlotState / GameState only when V2 is on;
+//  every field is optional so V1 saves hydrate unchanged.
+// ════════════════════════════════════════════════════════════════════
+
+/** A scheduled airport infrastructure change that completes in a future
+ *  round (tier upgrade, +100 slot-pack build, specialization switch,
+ *  operational-efficiency or retail-development investment). The engine
+ *  applies the effect when `completesRound` is reached, then drops it. */
+export interface AirportPendingUpgrade {
+  kind: "tier-upgrade" | "slot-pack" | "specialization-switch" | "efficiency" | "retail";
+  /** Round (1-based) the change takes effect. */
+  completesRound: number;
+  /** tier-upgrade: target ladder index 0..5. */
+  targetLadder?: number;
+  /** slot-pack: number of slots delivered. */
+  slotsAdded?: number;
+  /** specialization-switch: the target specialization + fork. */
+  targetSpecialization?: AirportSpecialization;
+  targetFork?: AirportSpecializationFork;
+}
+
+/** A government demand attached to an acquisition negotiation (or a
+ *  standing obligation accepted to close one). `magnitude` is USD for
+ *  cash/recurring shapes, a fraction for equity/premium shapes, or a
+ *  round count for operational obligations. */
+export interface AirportActiveDemand {
+  type: AirportDemandType;
+  /** Resolved size after the demand-cost multiplier (USD / fraction /
+   *  rounds depending on the demand shape). */
+  magnitude: number;
+  /** Whether the airline accepted this demand. */
+  accepted: boolean;
+  /** Operational demands: the round by which the obligation must be met
+   *  (capacity-expansion) or through which it runs (route-service). */
+  dueRound?: number;
+}
+
+/** A single sealed bid in a V2 privatization auction. The deposit is
+ *  escrowed on submission; the bidder's GAP score is snapshotted so the
+ *  adjudication is deterministic and reproducible. */
+export interface AirportSealedBid {
+  teamId: string;
+  amountUsd: number;
+  /** GAP (Government Acceptance Probability) score at submission, 0..95. */
+  gap: number;
+  submittedRound: number;
+}
+
+/** A V2 privatization auction for one released airport. The government
+ *  announces it on a schedule (privatizationSchedule), collects sealed
+ *  bids, then adjudicates money-vs-confidence to pick a winner who then
+ *  enters the approval gauntlet. */
+export interface AirportAuction {
+  /** Stable id, "auc_<random>". */
+  id: string;
+  airportCode: string;
+  /** Ladder index of the airport at release. */
+  ladder: number;
+  /** Round the auction was announced + sealed bids opened. */
+  announcedRound: number;
+  /** Round bids close and the winner is adjudicated. */
+  closesRound: number;
+  /** Reserve floor for this ladder — bids below are rejected. */
+  reserveFloorUsd: number;
+  status: "open" | "adjudicated" | "approval" | "completed" | "failed";
+  bids: AirportSealedBid[];
+  /** Winning team after adjudication (before approval completes). */
+  winnerTeamId?: string;
+  winningBidUsd?: number;
+}
+
+/** The approval gauntlet a won auction enters: the government issues
+ *  demands the winner must accept (≥ minToAccept) before the transfer of
+ *  operating control closes. Failing forfeits the escrowed deposit. */
+export interface AirportApprovalProcess {
+  /** Stable id, "appr_<random>". */
+  id: string;
+  airportCode: string;
+  teamId: string;
+  ladder: number;
+  /** Round the approval window opened. */
+  openedRound: number;
+  /** Round by which enough demands must be accepted, else collapse. */
+  deadlineRound: number;
+  /** Deposit escrowed at auction win — forfeit on collapse. */
+  depositUsd: number;
+  /** Demands issued by the government for this acquisition. */
+  demands: AirportActiveDemand[];
+  /** Minimum demands that must be accepted to close (ceil 70%). */
+  minToAccept: number;
+  status: "pending" | "approved" | "collapsed";
+}
+
 /** Slot bidding state for a single airport. Players bid in pendingSlotBids
  *  and the engine resolves at quarter-close: highest pricePerSlot wins,
  *  unsold slots roll forward. Yearly random opens add to `available`. */
@@ -1298,6 +1429,39 @@ export interface AirportSlotState {
   acquiredAtQuarter?: number;
   /** Original purchase price paid (for cost-basis display). */
   purchaseCostUsd?: number;
+
+  // ─── V2 fields (session.airportSystemV2 only; see airport-system-v2.ts) ──
+  /** Internal ladder index 0..5 (Local..Mega Gateway). Undefined = derive
+   *  from the city tier; set once a tier upgrade completes. */
+  ladder?: number;
+  /** Owner-chosen commercial specialization + active fork. */
+  specialization?: AirportSpecialization;
+  specializationFork?: AirportSpecializationFork;
+  /** Retail development level (0.5..1.5) — the non-aero yield multiplier. */
+  retailDevelopmentLevel?: number;
+  /** Owner-set fee schedule, overriding the public default within
+   *  elasticity bounds (undefined = charge the ladder default). */
+  slotFeeUsd?: number;
+  landingFeeUsd?: number;
+  passengerChargeUsd?: number;
+  /** Operating-cost ratio (0.30..0.45), lowered by efficiency investment. */
+  airportOpexRatio?: number;
+  /** Fraction of slots the owner reserves for its own airline (≤0.40). */
+  reservedSlotPct?: number;
+  /** Self-vs-rival fee discount the owner grants its own airline (≤0.15). */
+  ownerSelfDiscountPct?: number;
+  /** Scandal-risk exposure accumulated from accepted lobbying demands. */
+  lobbyingExposure?: number;
+  /** Consecutive rounds the owner's slot block here has gone unused
+   *  (use-it-or-lose-it reclamation counter). */
+  unusedSlotRoundCount?: number;
+  /** Background (simulated) slots consumed this round — cached for the UI
+   *  scarcity meter; recomputed each close from backgroundSlotsUsed(). */
+  backgroundSlotsUsed?: number;
+  /** In-progress infrastructure changes that complete in a future round. */
+  pendingUpgrades?: AirportPendingUpgrade[];
+  /** Standing government obligations accepted to win this airport. */
+  activeDemands?: AirportActiveDemand[];
 }
 
 /** Pending bid to acquire an airport outright. Submitted by a player
