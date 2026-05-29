@@ -110,10 +110,16 @@ import {
   AIRPORT_OWNER_SELF_DISCOUNT_MAX,
   AIRPORT_TIER_SPECS,
   AIRPORT_DEMAND_DEFS,
+  AIRPORT_SPECIALIZATIONS,
+  AIRPORT_SPECIALIZATION_SWITCH_COST,
+  AIRPORT_SPECIALIZATION_SWITCH_ROUNDS,
+  specializationForFork,
   resolveSealedAuction,
   minDemandsToAccept,
   isPrivatizationRound,
   type SealedBid,
+  type AirportSpecialization,
+  type AirportSpecializationFork,
 } from "@/lib/airport-system-v2";
 import {
   gapFor,
@@ -145,6 +151,7 @@ import type {
   AirportAuction,
   AirportBid,
   AirportLease,
+  AirportPendingUpgrade,
   AirportSealedBid,
   AirportSlotState,
   CabinConfig,
@@ -476,6 +483,34 @@ export interface GameStore extends GameState {
   setAirportSelfDiscount(args: {
     airportCode: string;
     pct: number;
+  }): { ok: boolean; error?: string };
+
+  /** Owner-only (V2 §8): pick the airport's initial commercial specialization
+   *  and its fork. Free and immediate the FIRST time (no specialization yet);
+   *  if a specialization is already set, callers must use
+   *  switchAirportSpecialization (costly rebuild) instead. */
+  chooseAirportSpecialization(args: {
+    airportCode: string;
+    specialization: AirportSpecialization;
+    fork: AirportSpecializationFork;
+  }): { ok: boolean; error?: string };
+
+  /** Owner-only (V2 §8): toggle the active fork WITHIN the current
+   *  specialization. A cheap config change — immediate, no rebuild. Rejects a
+   *  fork that doesn't belong to the airport's current specialization. */
+  setAirportFork(args: {
+    airportCode: string;
+    fork: AirportSpecializationFork;
+  }): { ok: boolean; error?: string };
+
+  /** Owner-only (V2 §8): switch to a DIFFERENT specialization. A costly
+   *  rebuild (AIRPORT_SPECIALIZATION_SWITCH_COST) with a build period
+   *  (AIRPORT_SPECIALIZATION_SWITCH_ROUNDS); schedules a pending upgrade that
+   *  the quarter-close applier activates when the build completes. */
+  switchAirportSpecialization(args: {
+    airportCode: string;
+    specialization: AirportSpecialization;
+    fork: AirportSpecializationFork;
   }): { ok: boolean; error?: string };
 
   addEcoUpgrade(aircraftId: string): { ok: boolean; error?: string };
@@ -2824,6 +2859,144 @@ export const useGame = create<GameStore>()(
           `Your own flights billed ${(clamped * 100).toFixed(0)}% below the rival slot rate (regulator-capped at 15%).`,
         );
         void get().pushStateToServer("player.setAirportSelfDiscount", { airportCode });
+        return { ok: true };
+      },
+
+      chooseAirportSpecialization: ({ airportCode, specialization, fork }) => {
+        const s = get();
+        const player = s.teams.find((t) => t.id === s.playerTeamId);
+        if (!player) return { ok: false, error: "No player team" };
+        const slotState = s.airportSlots?.[airportCode];
+        if (!slotState?.ownerTeamId || slotState.ownerTeamId !== player.id) {
+          return { ok: false, error: "You don't own this airport" };
+        }
+        if (slotState.specialization) {
+          return {
+            ok: false,
+            error: "Already specialized — use Switch specialization to rebuild",
+          };
+        }
+        const def = AIRPORT_SPECIALIZATIONS[specialization];
+        if (!def) return { ok: false, error: "Unknown specialization" };
+        if (!def.forks.some((f) => f.id === fork)) {
+          return { ok: false, error: `${fork} is not a ${def.name} fork` };
+        }
+        set({
+          airportSlots: {
+            ...s.airportSlots,
+            [airportCode]: {
+              ...slotState,
+              specialization,
+              specializationFork: fork,
+            },
+          },
+        });
+        const city = CITIES_BY_CODE[airportCode];
+        const forkName = def.forks.find((f) => f.id === fork)?.name ?? fork;
+        toast.success(
+          `Specialized · ${city?.name ?? airportCode}`,
+          `${def.name} — ${forkName} fork. Effective next quarter.`,
+        );
+        void get().pushStateToServer("player.chooseAirportSpecialization", { airportCode });
+        return { ok: true };
+      },
+
+      setAirportFork: ({ airportCode, fork }) => {
+        const s = get();
+        const player = s.teams.find((t) => t.id === s.playerTeamId);
+        if (!player) return { ok: false, error: "No player team" };
+        const slotState = s.airportSlots?.[airportCode];
+        if (!slotState?.ownerTeamId || slotState.ownerTeamId !== player.id) {
+          return { ok: false, error: "You don't own this airport" };
+        }
+        if (!slotState.specialization) {
+          return { ok: false, error: "Choose a specialization first" };
+        }
+        // A fork toggle is only legal within the airport's current
+        // specialization — switching to another specialization's fork is the
+        // costly rebuild path, not this cheap config change.
+        if (specializationForFork(fork) !== slotState.specialization) {
+          return {
+            ok: false,
+            error: "That fork belongs to a different specialization",
+          };
+        }
+        if (slotState.specializationFork === fork) {
+          return { ok: false, error: "That fork is already active" };
+        }
+        set({
+          airportSlots: {
+            ...s.airportSlots,
+            [airportCode]: { ...slotState, specializationFork: fork },
+          },
+        });
+        const city = CITIES_BY_CODE[airportCode];
+        const def = AIRPORT_SPECIALIZATIONS[slotState.specialization];
+        const forkName = def?.forks.find((f) => f.id === fork)?.name ?? fork;
+        toast.accent(
+          `Fork switched · ${city?.name ?? airportCode}`,
+          `Now running the ${forkName} fork. Effective next quarter.`,
+        );
+        void get().pushStateToServer("player.setAirportFork", { airportCode });
+        return { ok: true };
+      },
+
+      switchAirportSpecialization: ({ airportCode, specialization, fork }) => {
+        const s = get();
+        const player = s.teams.find((t) => t.id === s.playerTeamId);
+        if (!player) return { ok: false, error: "No player team" };
+        const slotState = s.airportSlots?.[airportCode];
+        if (!slotState?.ownerTeamId || slotState.ownerTeamId !== player.id) {
+          return { ok: false, error: "You don't own this airport" };
+        }
+        const def = AIRPORT_SPECIALIZATIONS[specialization];
+        if (!def) return { ok: false, error: "Unknown specialization" };
+        if (!def.forks.some((f) => f.id === fork)) {
+          return { ok: false, error: `${fork} is not a ${def.name} fork` };
+        }
+        if (slotState.specialization === specialization) {
+          return {
+            ok: false,
+            error: "Already this specialization — change fork instead",
+          };
+        }
+        // Block stacking a second rebuild while one is already building.
+        if (slotState.pendingUpgrades?.some((u) => u.kind === "specialization-switch")) {
+          return { ok: false, error: "A specialization rebuild is already in progress" };
+        }
+        if (player.cashUsd < AIRPORT_SPECIALIZATION_SWITCH_COST) {
+          return {
+            ok: false,
+            error: `Need ${fmtMoneyPlain(AIRPORT_SPECIALIZATION_SWITCH_COST)} cash to rebuild`,
+          };
+        }
+        const completesRound = s.currentQuarter + AIRPORT_SPECIALIZATION_SWITCH_ROUNDS;
+        const pending: AirportPendingUpgrade = {
+          kind: "specialization-switch",
+          completesRound,
+          targetSpecialization: specialization,
+          targetFork: fork,
+        };
+        set({
+          teams: s.teams.map((t) =>
+            t.id === player.id
+              ? { ...t, cashUsd: t.cashUsd - AIRPORT_SPECIALIZATION_SWITCH_COST }
+              : t,
+          ),
+          airportSlots: {
+            ...s.airportSlots,
+            [airportCode]: {
+              ...slotState,
+              pendingUpgrades: [...(slotState.pendingUpgrades ?? []), pending],
+            },
+          },
+        });
+        const city = CITIES_BY_CODE[airportCode];
+        toast.success(
+          `Rebuild started · ${city?.name ?? airportCode}`,
+          `${fmtMoneyPlain(AIRPORT_SPECIALIZATION_SWITCH_COST)} committed to convert to ${def.name}. Live in ${AIRPORT_SPECIALIZATION_SWITCH_ROUNDS} quarters.`,
+        );
+        void get().pushStateToServer("player.switchAirportSpecialization", { airportCode });
         return { ok: true };
       },
 
@@ -6943,6 +7116,38 @@ export const useGame = create<GameStore>()(
             }
             return cost;
           };
+
+          // ── Phase 0: apply due infrastructure builds (§8) ──────────────
+          // Specialization rebuilds (and any other pendingUpgrades) complete
+          // when their build period elapses. Apply the effect, then drop the
+          // upgrade so it never fires twice.
+          for (const [code, slot] of Object.entries(v2Slots)) {
+            const pending = slot.pendingUpgrades;
+            if (!pending || pending.length === 0) continue;
+            const due = pending.filter((u) => u.completesRound <= nextQ);
+            if (due.length === 0) continue;
+            const remaining = pending.filter((u) => u.completesRound > nextQ);
+            let next: AirportSlotState = { ...slot };
+            for (const u of due) {
+              if (u.kind === "specialization-switch" && u.targetSpecialization) {
+                next = {
+                  ...next,
+                  specialization: u.targetSpecialization,
+                  specializationFork: u.targetFork,
+                };
+                if (isPlayerTeam(slot.ownerTeamId ?? "")) {
+                  const def = AIRPORT_SPECIALIZATIONS[u.targetSpecialization];
+                  const city = CITIES_BY_CODE[code];
+                  toast.success(
+                    `Rebuild complete · ${city?.name ?? code}`,
+                    `Now running as a ${def?.name ?? u.targetSpecialization}.`,
+                  );
+                }
+              }
+            }
+            next.pendingUpgrades = remaining.length ? remaining : undefined;
+            v2Slots = { ...v2Slots, [code]: next };
+          }
 
           // ── Phase 1: advance approval gauntlets at their deadline ──────
           const nextApprovals: AirportApprovalProcess[] = [];

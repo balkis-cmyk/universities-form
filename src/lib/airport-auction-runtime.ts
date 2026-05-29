@@ -41,11 +41,13 @@ import {
   demandCostMultiplier,
   privatizationCycleIndex,
   computeAirportRevenue,
+  forkEffect,
   type AirportTraffic,
+  type AirportTrafficSegment,
   type AirportRevenueBreakdown,
   type AirportFeeSchedule,
 } from "@/lib/airport-system-v2";
-import { computeBrandValue, computeNetEquityUsd, QUARTER_DAYS } from "@/lib/engine";
+import { computeBrandValue, computeNetEquityUsd, routeQuarterlyFuelBurnL, QUARTER_DAYS } from "@/lib/engine";
 
 const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
 
@@ -379,6 +381,34 @@ export function aggregateAirportTraffic(args: {
   return { player, background, ownerSlotsUsed };
 }
 
+/** Estimated jet fuel litres uplifted (burned) at the airport this quarter
+ *  across EVERY airline plus background carriers. Fuel is uplifted at the
+ *  departure airport, so player burn counts routes whose ORIGIN is this code
+ *  (mirroring the cityQuarterlyBurnL convention in the engine). Background
+ *  departures derive from the airport's occupied background slots × a typical
+ *  narrowbody per-flight uplift. Drives the Cargo Fuel Farm fork's margin. */
+const BG_FUEL_PER_DEPARTURE_L = 11_000;
+
+export function fuelFarmLitresBurned(args: {
+  teams: Team[];
+  airportCode: string;
+  slotState: AirportSlotState;
+}): number {
+  const { teams, airportCode, slotState } = args;
+  let litres = 0;
+  for (const t of teams) {
+    for (const r of t.routes ?? []) {
+      if (r.status !== "active") continue;
+      if (r.originCode !== airportCode) continue;
+      litres += routeQuarterlyFuelBurnL(t, r);
+    }
+  }
+  const bgSlots = slotState.backgroundSlotsUsed ?? 0;
+  const bgDepartures = bgSlots * AIRPORT_QUARTER_WEEKS;
+  litres += bgDepartures * BG_FUEL_PER_DEPARTURE_L;
+  return litres;
+}
+
 /** Per-quarter ongoing demand obligations (recurring + operational + equity
  *  dividends approximated as a small revenue share) for an owned airport. */
 function ongoingDemandCostsUsd(
@@ -426,9 +456,32 @@ export function computeOwnedAirportRevenue(args: {
 
   const traffic = aggregateAirportTraffic({ teams, airportCode, slotState, ownerTeamId });
 
-  const specModifier = slotState.specialization
+  // §8 fork levers tune the specialization in a concrete direction.
+  const fe = forkEffect(slotState.specializationFork);
+
+  // Background-traffic forks (Free Trade Zone, High-Density Apron, Biometric)
+  // scale the simulated carrier traffic the airport draws.
+  if (fe.backgroundTrafficMult !== 1) {
+    const m = fe.backgroundTrafficMult;
+    const bg: AirportTrafficSegment = {
+      slotsUsed: traffic.background.slotsUsed * m,
+      movements: traffic.background.movements * m,
+      departingPax: traffic.background.departingPax * m,
+      throughputPax: traffic.background.throughputPax * m,
+    };
+    traffic.background = bg;
+  }
+
+  const baseSpecModifier = slotState.specialization
     ? AIRPORT_SPECIALIZATIONS[slotState.specialization]?.nonAeroModifier ?? 1
     : 1;
+  const specModifier = baseSpecModifier * fe.nonAeroMult;
+  const opexRatio = (slotState.airportOpexRatio ?? AIRPORT_OPEX_RATIO_BASELINE) + fe.opexDelta;
+
+  // Cargo Fuel Farm: margin × every litre burned at the airport by anyone.
+  const fuelFarmMarginUsdPerL = fe.fuelFarmMarginUsdPerL;
+  const fuelLitresBurned =
+    fuelFarmMarginUsdPerL > 0 ? fuelFarmLitresBurned({ teams, airportCode, slotState }) : 0;
 
   // Rough gross estimate for the equity-dividend demand (avoids a circular
   // dependency: equity draws a share of gross, so estimate gross sans demand
@@ -442,8 +495,10 @@ export function computeOwnedAirportRevenue(args: {
     marketFees,
     retailLevel: slotState.retailDevelopmentLevel ?? 1,
     specializationModifier: specModifier,
-    opexRatio: slotState.airportOpexRatio ?? AIRPORT_OPEX_RATIO_BASELINE,
+    opexRatio,
     ongoingDemandCostsUsd: ongoingDemandCostsUsd(slotState, grossEstimate),
     selfDiscountPct: slotState.ownerSelfDiscountPct ?? 0,
+    fuelFarmMarginUsdPerL,
+    fuelLitresBurned,
   });
 }

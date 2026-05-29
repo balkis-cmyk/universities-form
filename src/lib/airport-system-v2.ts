@@ -689,6 +689,76 @@ export const AIRPORT_SPECIALIZATIONS: Record<AirportSpecialization, Specializati
 export const AIRPORT_SPECIALIZATION_SWITCH_COST = 250_000_000;
 export const AIRPORT_SPECIALIZATION_SWITCH_ROUNDS = 3;
 
+/** §8 fork levers. Each fork tunes the specialization in a concrete direction.
+ *  Forks within one specialization are alternatives (pick one); switching fork
+ *  inside a specialization is a config toggle (cheap), switching specialization
+ *  is a costly rebuild (AIRPORT_SPECIALIZATION_SWITCH_COST + build period). */
+export interface ForkEffect {
+  /** Multiplier applied ON TOP of the specialization's base non-aero modifier
+   *  (e.g. Experience trades volume for higher spend per head). */
+  nonAeroMult: number;
+  /** Additive change to the airport opex ratio (negative = leaner to run,
+   *  e.g. Ground-Handling Automation; positive = a fuel farm's extra ops). */
+  opexDelta: number;
+  /** Fuel Farm ONLY: USD margin captured on every litre of jet fuel burned at
+   *  the airport by ANY airline — players AND background traffic. The purest
+   *  rent-extraction lever; 0 on every other fork. */
+  fuelFarmMarginUsdPerL: number;
+  /** Multiplier on background (simulated) traffic at the airport. Free Trade
+   *  Zone lifts cargo/freight demand; High-Density Apron and Biometric
+   *  Fast-Track raise effective throughput from the same runway capacity. */
+  backgroundTrafficMult: number;
+  /** Own-passenger satisfaction synergy at this airport (additive, 0..1).
+   *  Carried here so a fork's full effect is specified in one place; the
+   *  satisfaction wiring lands with the regulatory/experience phase. */
+  ownPaxSatisfactionBonus: number;
+}
+
+const NEUTRAL_FORK: ForkEffect = {
+  nonAeroMult: 1,
+  opexDelta: 0,
+  fuelFarmMarginUsdPerL: 0,
+  backgroundTrafficMult: 1,
+  ownPaxSatisfactionBonus: 0,
+};
+
+/** Per-litre fuel-farm margin (USD) for the Cargo Fuel Farm fork. Sized as a
+ *  thin into-plane spread over the baseline jet-fuel price (~$0.85/L in the
+ *  engine): real, compounding rent on every litre — meaningful at a busy
+ *  freight airport without dwarfing the aeronautical lines. */
+export const FUEL_FARM_MARGIN_USD_PER_L = 0.05;
+
+export const FORK_EFFECTS: Record<AirportSpecializationFork, ForkEffect> = {
+  // Passenger Mega-Hub — volume vs. experience.
+  volume: { ...NEUTRAL_FORK, nonAeroMult: 0.92, backgroundTrafficMult: 1.12 },
+  experience: { ...NEUTRAL_FORK, nonAeroMult: 1.2, backgroundTrafficMult: 0.96, ownPaxSatisfactionBonus: 0.05 },
+  // Cargo & Logistics — own the fuel vs. own the freight demand.
+  "fuel-farm": { ...NEUTRAL_FORK, fuelFarmMarginUsdPerL: FUEL_FARM_MARGIN_USD_PER_L, opexDelta: 0.02 },
+  "free-trade-zone": { ...NEUTRAL_FORK, backgroundTrafficMult: 1.25 },
+  // Premium Gateway — private-aviation yield vs. throughput.
+  "vip-terminal": { ...NEUTRAL_FORK, nonAeroMult: 1.15 },
+  "biometric-fast-track": { ...NEUTRAL_FORK, backgroundTrafficMult: 1.08, ownPaxSatisfactionBonus: 0.04 },
+  // Low-Cost Efficiency Base — cheaper ops vs. more turns.
+  "ground-handling-automation": { ...NEUTRAL_FORK, opexDelta: -0.05, ownPaxSatisfactionBonus: 0.03 },
+  "high-density-apron": { ...NEUTRAL_FORK, backgroundTrafficMult: 1.15 },
+};
+
+/** Resolve a fork's levers; a neutral (no-op) effect when no fork is set. */
+export function forkEffect(fork: AirportSpecializationFork | null | undefined): ForkEffect {
+  if (!fork) return NEUTRAL_FORK;
+  return FORK_EFFECTS[fork] ?? NEUTRAL_FORK;
+}
+
+/** Which specialization a fork belongs to (for validation: a fork can only be
+ *  set on its parent specialization). */
+export function specializationForFork(fork: AirportSpecializationFork): AirportSpecialization {
+  for (const def of Object.values(AIRPORT_SPECIALIZATIONS)) {
+    if (def.forks.some((f) => f.id === fork)) return def.id;
+  }
+  // Unreachable for the eight defined forks; satisfies the type checker.
+  return "passenger-mega-hub";
+}
+
 // ─── §7 Ownership economics defaults ────────────────────────────────────
 
 /** Baseline operating-cost ratio (gross airport revenue → opex). Reduced by
@@ -828,6 +898,12 @@ export interface AirportRevenueParams {
   ongoingDemandCostsUsd: number;
   /** Owner self slot-fee discount, 0..0.15 (regulator-capped). */
   selfDiscountPct: number;
+  /** Fuel Farm fork: USD margin captured per litre burned at the airport
+   *  (0 when the fork is not built). */
+  fuelFarmMarginUsdPerL?: number;
+  /** Total jet fuel litres burned at the airport this quarter across ALL
+   *  airlines + background traffic (only consulted when the margin > 0). */
+  fuelLitresBurned?: number;
 }
 
 export interface AirportRevenueBreakdown {
@@ -835,6 +911,9 @@ export interface AirportRevenueBreakdown {
   landingRevenue: number;
   paxChargeRevenue: number;
   nonAeroRevenue: number;
+  /** Cargo Fuel Farm fork: near-pure margin on every litre burned here. Added
+   *  to net AFTER opex (it is already a margin, not subject to airport opex). */
+  fuelFarmRevenue: number;
   gross: number;
   opex: number;
   ongoingDemandCostsUsd: number;
@@ -889,13 +968,23 @@ export function computeAirportRevenue(
   const gross = slotRevenue + landingRevenue + paxChargeRevenue + nonAeroRevenue;
   const opexRatio = Math.max(AIRPORT_OPEX_RATIO_FLOOR, Math.min(AIRPORT_OPEX_RATIO_BASELINE, p.opexRatio));
   const opex = gross * opexRatio;
-  const net = gross - opex - Math.max(0, p.ongoingDemandCostsUsd);
+
+  // Fuel Farm: margin × litres burned at the airport by everyone. Already a
+  // net spread (sell − buy), so it bypasses the airport opex ratio and lands
+  // straight on net. Zero unless the Cargo Fuel Farm fork is built.
+  const fuelFarmRevenue = Math.max(
+    0,
+    (p.fuelLitresBurned ?? 0) * Math.max(0, p.fuelFarmMarginUsdPerL ?? 0),
+  );
+
+  const net = gross - opex - Math.max(0, p.ongoingDemandCostsUsd) + fuelFarmRevenue;
 
   return {
     slotRevenue,
     landingRevenue,
     paxChargeRevenue,
     nonAeroRevenue,
+    fuelFarmRevenue,
     gross,
     opex,
     ongoingDemandCostsUsd: Math.max(0, p.ongoingDemandCostsUsd),
