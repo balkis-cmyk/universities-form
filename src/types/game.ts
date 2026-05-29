@@ -566,7 +566,7 @@ export interface Team {
     specName: string;
     acquiredAtQuarter: number;
     exitQuarter: number;
-    exitReason: "retired" | "sold" | "lease-returned" | "crashed";
+    exitReason: "retired" | "sold" | "lease-returned" | "crashed" | "scrapped";
     proceedsUsd: number;
     acquisitionType: "buy" | "lease";
   }>;

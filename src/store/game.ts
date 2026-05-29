@@ -49,7 +49,7 @@ import {
   loadSnapshot as snapLoad,
   deleteSnapshot as snapDelete,
 } from "@/lib/snapshots";
-import { FUEL_TANK_SPECS, FUEL_TANK_MAX_COUNT, operatedCities, effectiveBaseRatePct, effectiveRangeKm, effectiveTravelIndex, effectiveUnlockQuarter, newsFuelIndexHint } from "@/lib/engine";
+import { FUEL_TANK_SPECS, FUEL_TANK_MAX_COUNT, operatedCities, effectiveBaseRatePct, effectiveRangeKm, effectiveTravelIndex, effectiveUnlockQuarter, newsFuelIndexHint, brokerResaleQuoteUsd, salvageQuoteUsd } from "@/lib/engine";
 import {
   totalUpgradeCostPerPlaneUsd,
   amenityCostUsd,
@@ -799,8 +799,12 @@ export interface GameStore extends GameState {
   suspendRoute(routeId: string): { ok: boolean; error?: string };
   resumeRoute(routeId: string): { ok: boolean; error?: string };
 
-  /** List an aircraft on the second-hand market (A13). */
-  listSecondHand(aircraftId: string, askingPriceUsd: number): { ok: boolean; error?: string };
+  /** Sell an owned aircraft to the broker at its single fixed quote
+   *  (P6). The broker takes the airframe to the open market. */
+  sellToBroker(aircraftId: string): { ok: boolean; error?: string; proceeds?: number };
+  /** Scrap an owned aircraft for salvage — half the broker quote. The
+   *  airframe leaves the game entirely (never reaches the market). */
+  salvageAircraft(aircraftId: string): { ok: boolean; error?: string; proceeds?: number };
   /** Buy from the second-hand market. */
   buySecondHand(listingId: string): { ok: boolean; error?: string };
   /** Admin: inject a new listing from the system. */
@@ -9401,99 +9405,38 @@ export const useGame = create<GameStore>()(
       // The threshold is exposed via BROKER_BUY_THRESHOLD so the UI
       // can preview "Broker will instantly buy" vs "Marketplace
       // listing" before submission.
-      listSecondHand: (aircraftId, askingPriceUsd) => {
+      // ── P6 — broker-only resale ─────────────────────────────────
+      // No slider, no negotiation. The broker pays ONE quote (a haircut
+      // off current book) and takes the airframe to the open market.
+      sellToBroker: (aircraftId) => {
         const s = get();
         const player = s.teams.find((t) => t.id === s.playerTeamId);
         if (!player) return { ok: false, error: "No player" };
         const plane = player.fleet.find((f) => f.id === aircraftId);
         if (!plane) return { ok: false, error: "Aircraft not found" };
-        if (plane.acquisitionType !== "buy") return { ok: false, error: "Only owned aircraft" };
-        // Listing bounds: floor at 20% of book value (fire-sale clearance),
-        // ceiling at 120% of the airframe's current new-build list price.
-        const spec = AIRCRAFT_BY_ID[plane.specId];
-        const minPrice = Math.round(plane.bookValue * 0.20);
-        const maxPrice = Math.round((spec?.buyPriceUsd ?? plane.bookValue) * 1.20);
-        if (askingPriceUsd < minPrice)
-          return { ok: false, error: `Minimum ${fmtMoneyPlain(minPrice)} (20% of book)` };
-        if (askingPriceUsd > maxPrice)
-          return { ok: false, error: `Max ${fmtMoneyPlain(maxPrice)} (120% of market list price)` };
+        if (plane.acquisitionType !== "buy")
+          return { ok: false, error: "Leased aircraft can't be sold — return at term end." };
         const specName = AIRCRAFT_BY_ID[plane.specId]?.name ?? plane.specId;
+        const proceeds = brokerResaleQuoteUsd(plane.bookValue);
 
-        // ── Broker threshold check ────────────────────────────
-        // 75% of current book. If the player accepts this haircut
-        // for instant liquidity, the broker takes the plane and
-        // re-lists at full book.
-        const BROKER_BUY_THRESHOLD = 0.75;
-        const brokerThreshold = Math.round(plane.bookValue * BROKER_BUY_THRESHOLD);
-        const isInstantBrokerSale = askingPriceUsd <= brokerThreshold;
-
-        if (isInstantBrokerSale) {
-          // Broker re-listing at full book value. Random other-
-          // player buyers see this in the marketplace and may
-          // pick it up; until then it sits in the listing pool
-          // tagged sellerTeamId="broker".
-          const brokerListing: SecondHandListing = {
-            id: mkId("sh"),
-            specId: plane.specId,
-            askingPriceUsd: Math.round(plane.bookValue),
-            listedAtQuarter: s.currentQuarter,
-            sellerTeamId: "broker",
-            ecoUpgrade: plane.ecoUpgrade,
-            cabinConfig: plane.cabinConfig,
-            manufactureQuarter: plane.purchaseQuarter,
-            retirementQuarter: plane.retirementQuarter,
-          };
-          set({
-            secondHandListings: [...s.secondHandListings, brokerListing],
-            teams: s.teams.map((t) => t.id !== player.id ? t : {
-              ...t,
-              // Player gets the cash NOW (the listed sub-book price).
-              cashUsd: t.cashUsd + askingPriceUsd,
-              fleet: t.fleet.filter((f) => f.id !== aircraftId),
-              routes: t.routes.map((r) => ({
-                ...r,
-                aircraftIds: r.aircraftIds.filter((id) => id !== aircraftId),
-              })),
-              retiredHistory: [
-                ...(t.retiredHistory ?? []),
-                {
-                  id: aircraftId,
-                  specId: plane.specId,
-                  specName,
-                  acquiredAtQuarter: plane.purchaseQuarter,
-                  exitQuarter: s.currentQuarter,
-                  exitReason: "sold" as const,
-                  proceedsUsd: askingPriceUsd,
-                  acquisitionType: plane.acquisitionType,
-                },
-              ],
-            }),
-          });
-          const realisedLoss = plane.bookValue - askingPriceUsd;
-          toast.warning(
-            `Broker bought ${specName}`,
-            `Proceeds ${fmtMoneyPlain(askingPriceUsd)} · realised loss ${fmtMoneyPlain(realisedLoss)} vs book. Broker re-listed at ${fmtMoneyPlain(Math.round(plane.bookValue))}.`,
-          );
-          return { ok: true };
-        }
-
-        // Peer-to-peer listing (above broker threshold). Stays on
-        // the marketplace until another team buys it.
-        const listing: SecondHandListing = {
+        // The broker re-lists the airframe on the open market at full
+        // book value — rivals can pick it up. Tagged sellerTeamId="broker".
+        const brokerListing: SecondHandListing = {
           id: mkId("sh"),
           specId: plane.specId,
-          askingPriceUsd,
+          askingPriceUsd: Math.round(plane.bookValue),
           listedAtQuarter: s.currentQuarter,
-          sellerTeamId: player.id,
+          sellerTeamId: "broker",
           ecoUpgrade: plane.ecoUpgrade,
           cabinConfig: plane.cabinConfig,
           manufactureQuarter: plane.purchaseQuarter,
           retirementQuarter: plane.retirementQuarter,
         };
         set({
-          secondHandListings: [...s.secondHandListings, listing],
+          secondHandListings: [...s.secondHandListings, brokerListing],
           teams: s.teams.map((t) => t.id !== player.id ? t : {
             ...t,
+            cashUsd: t.cashUsd + proceeds,
             fleet: t.fleet.filter((f) => f.id !== aircraftId),
             routes: t.routes.map((r) => ({
               ...r,
@@ -9508,15 +9451,64 @@ export const useGame = create<GameStore>()(
                 acquiredAtQuarter: plane.purchaseQuarter,
                 exitQuarter: s.currentQuarter,
                 exitReason: "sold" as const,
-                proceedsUsd: askingPriceUsd,
+                proceedsUsd: proceeds,
                 acquisitionType: plane.acquisitionType,
               },
             ],
           }),
         });
-        toast.info(`Listed for sale: ${specName}`,
-          `Asking ${fmtMoneyPlain(askingPriceUsd)} on the marketplace (above broker threshold).`);
-        return { ok: true };
+        const realisedLoss = Math.round(plane.bookValue) - proceeds;
+        toast.warning(
+          `Broker bought ${specName}`,
+          `Paid ${fmtMoneyPlain(proceeds)} · ${fmtMoneyPlain(realisedLoss)} below book. The broker re-listed it on the market.`,
+        );
+        void get().pushStateToServer("player.soldToBroker", { aircraftId, proceeds });
+        return { ok: true, proceeds };
+      },
+
+      salvageAircraft: (aircraftId) => {
+        const s = get();
+        const player = s.teams.find((t) => t.id === s.playerTeamId);
+        if (!player) return { ok: false, error: "No player" };
+        const plane = player.fleet.find((f) => f.id === aircraftId);
+        if (!plane) return { ok: false, error: "Aircraft not found" };
+        if (plane.acquisitionType !== "buy")
+          return { ok: false, error: "Leased aircraft can't be salvaged — return at term end." };
+        const specName = AIRCRAFT_BY_ID[plane.specId]?.name ?? plane.specId;
+        const proceeds = salvageQuoteUsd(plane.bookValue);
+
+        // Salvage = airframe scrapped. It NEVER reaches the market, so a
+        // rival can't pick it up — the trade-off for the lower payout.
+        set({
+          teams: s.teams.map((t) => t.id !== player.id ? t : {
+            ...t,
+            cashUsd: t.cashUsd + proceeds,
+            fleet: t.fleet.filter((f) => f.id !== aircraftId),
+            routes: t.routes.map((r) => ({
+              ...r,
+              aircraftIds: r.aircraftIds.filter((id) => id !== aircraftId),
+            })),
+            retiredHistory: [
+              ...(t.retiredHistory ?? []),
+              {
+                id: aircraftId,
+                specId: plane.specId,
+                specName,
+                acquiredAtQuarter: plane.purchaseQuarter,
+                exitQuarter: s.currentQuarter,
+                exitReason: "scrapped" as const,
+                proceedsUsd: proceeds,
+                acquisitionType: plane.acquisitionType,
+              },
+            ],
+          }),
+        });
+        toast.info(
+          `Salvaged ${specName}`,
+          `Scrapped for ${fmtMoneyPlain(proceeds)} — kept off the open market.`,
+        );
+        void get().pushStateToServer("player.salvagedAircraft", { aircraftId, proceeds });
+        return { ok: true, proceeds };
       },
 
       buySecondHand: (listingId) => {

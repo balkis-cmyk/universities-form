@@ -2546,6 +2546,42 @@ export function depreciateBookValue(
   return Math.max(floor, decayed);
 }
 
+/**
+ * Broker resale economics (P6 — May 30 2026).
+ *
+ * The old model let the player pick any asking price on a slider (up to
+ * 120% of new-build list), which made resale feel "VERY high" — a near-new
+ * plane could be dumped for close to book and barely realise a loss.
+ *
+ * New model: no slider, no negotiation. The broker quotes ONE price, a
+ * haircut off the airframe's CURRENT book value (broker margin + the
+ * liquidity discount of an off-market quick sale). The player has exactly
+ * two choices:
+ *
+ *   • Sell to broker  →  BROKER_RESALE_PCT × book. The broker takes the
+ *                        plane to the open market (re-lists it for other
+ *                        airlines to buy). Player cashes out now.
+ *   • Salvage         →  half the broker quote (= 0.5 × BROKER_RESALE_PCT
+ *                        × book). The airframe is scrapped — it never goes
+ *                        on the market, so a rival can't pick it up cheap.
+ *
+ * 50% of book is a deliberate, legible discount: a one-quarter-old plane
+ * (book ≈ 80% of purchase) fetches ≈ 40% of what was paid — flipping is
+ * clearly a loss, holding-to-operate is the rational play.
+ */
+export const BROKER_RESALE_PCT = 0.5;
+/** Salvage proceeds = this fraction of the broker quote (half). */
+export const SALVAGE_FRACTION_OF_BROKER = 0.5;
+
+/** The broker's one-and-only cash quote for an owned airframe. */
+export function brokerResaleQuoteUsd(bookValueUsd: number): number {
+  return Math.max(0, Math.round(bookValueUsd * BROKER_RESALE_PCT));
+}
+/** Salvage proceeds — half the broker quote, airframe leaves the game. */
+export function salvageQuoteUsd(bookValueUsd: number): number {
+  return Math.max(0, Math.round(brokerResaleQuoteUsd(bookValueUsd) * SALVAGE_FRACTION_OF_BROKER));
+}
+
 // ─── Interest (PRD §5.7) ───────────────────────────────────
 export function effectiveBorrowingRate(team: Team, baseRatePct: number): number {
   // Lenders price against book equity, not brand-multiplied valuation

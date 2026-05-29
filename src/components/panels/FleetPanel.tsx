@@ -11,7 +11,7 @@ import { fmtMoney, fmtPct, fmtAgeYQ, fmtQuarter } from "@/lib/format";
 import { planeImagePath } from "@/lib/aircraft-images";
 import { cn } from "@/lib/cn";
 import { Plane, AlertTriangle, Clock, X } from "lucide-react";
-import { discontinuedMaintenanceBracket, effectiveUnlockQuarter, effectiveCutoffRound } from "@/lib/engine";
+import { discontinuedMaintenanceBracket, effectiveUnlockQuarter, effectiveCutoffRound, brokerResaleQuoteUsd, salvageQuoteUsd } from "@/lib/engine";
 import {
   effectiveProductionCap,
   estimatedDeliveryQuarter,
@@ -90,17 +90,14 @@ export function FleetPanel() {
     type: "buy" | "lease";
     prefill?: OrderPrefill;
   } | null>(null);
-  /** Listing-for-sale modal — bounds:
-   *    min = 20% of book value (fire-sale floor — clears fast)
-   *    max = 120% of the airframe's current new-build market price
-   *  The wider range lets a player undercut on tired old metal or
-   *  ride a hot-model premium when the secondary market is starved. */
+  /** Sell modal (P6) — no slider, no price choice.
+   *  The broker quotes ONE fixed cash price (50% of book) and re-lists the
+   *  airframe on the open market. The only alternative is salvage — half the
+   *  broker quote (25% of book) — which scraps the airframe off-market. */
   const [sellState, setSellState] = useState<{
     aircraftId: string;
     bookValue: number;
-    marketValue: number;   // spec.buyPriceUsd at current quarter
     name: string;
-    price: number;
   } | null>(null);
   /** Retire confirmation modal — replaces native confirm(). */
   const [retireState, setRetireState] = useState<{
@@ -911,15 +908,13 @@ export function FleetPanel() {
                             onClick={() => setSellState({
                               aircraftId: f.id,
                               bookValue: f.bookValue,
-                              marketValue: expanded.buyPriceUsd,
                               name: expanded.name,
-                              price: Math.round(f.bookValue * 1.0),
                             })}
                             className="rounded-lg border border-line hover:border-ink-muted bg-surface hover:bg-surface-hover text-left px-3 py-2.5 transition-colors"
                           >
                             <div className="text-[0.8125rem] font-semibold text-ink">Sell</div>
                             <div className="text-[0.6875rem] text-ink-muted mt-0.5">
-                              Broker buys ≤75% of book · marketplace ≥75%
+                              Broker quotes a fixed price
                             </div>
                           </button>
                         )}
@@ -958,124 +953,86 @@ export function FleetPanel() {
         );
       })()}
 
-      {/* Sell modal — proper UI replacing the legacy native prompt().
-          Phase E: surfaces the broker-buy threshold so the player
-          knows whether their chosen price will trigger an instant
-          buy by the broker (≤75% of current book value) or a normal
-          marketplace listing. */}
+      {/* Sell modal (P6) — no slider, no price choice. The broker
+          quotes ONE fixed cash price (50% of book) and re-lists the
+          airframe on the open market. The only alternative is salvage
+          — half the broker quote (25% of book) — which scraps the
+          airframe off-market. The player just picks one of two paths. */}
       {sellState && (() => {
-        const minPrice = Math.round(sellState.bookValue * 0.20);
-        const maxPrice = Math.round(sellState.marketValue * 1.20);
-        const clamped = Math.max(minPrice, Math.min(maxPrice, sellState.price));
-        // Phase E — broker threshold = 75% of book value. At or
-        // below this, the broker instantly buys the plane (player
-        // cashes out THIS quarter at the listed price); broker
-        // re-lists at full book. Above this, normal marketplace.
-        const brokerThreshold = Math.round(sellState.bookValue * 0.75);
-        const isBrokerSale = clamped <= brokerThreshold;
-        const realisedLoss = sellState.bookValue - clamped;
-        const realisedLossPct = sellState.bookValue > 0
-          ? (realisedLoss / sellState.bookValue) * 100
-          : 0;
+        const brokerQuote = brokerResaleQuoteUsd(sellState.bookValue);
+        const salvageQuote = salvageQuoteUsd(sellState.bookValue);
         return (
         <Modal open onClose={() => setSellState(null)} className="w-[min(560px,calc(100vw-3rem))]">
           <ModalHeader>
             <h2 className="font-display text-[1.25rem] text-ink leading-tight">
-              List {sellState.name} for sale
+              Sell {sellState.name}
             </h2>
             <p className="text-[0.8125rem] text-ink-muted mt-1">
-              Floor 20% of book ({fmtMoney(minPrice)}); ceiling 120% of new-build ({fmtMoney(maxPrice)}).
+              Current book value {fmtMoney(sellState.bookValue)}. Choose how to part with this airframe.
             </p>
           </ModalHeader>
-          <ModalBody className="space-y-3">
-            <div className="rounded-md border border-line bg-surface-2/40 p-3 space-y-3">
-              <div className="flex items-baseline justify-between text-[0.8125rem]">
-                <span className="text-ink-muted">Asking price</span>
-                <span className="font-mono tabular text-ink font-semibold text-[1rem]">
-                  {fmtMoney(clamped)}
-                </span>
+          <ModalBody className="space-y-2.5">
+            {/* Broker — the headline path. One fixed quote, cash this
+                quarter, airframe goes back on the open market. */}
+            <div className="rounded-md border border-primary bg-[var(--accent-soft)] p-3.5">
+              <div className="flex items-baseline justify-between">
+                <div className="text-[0.625rem] uppercase tracking-wider font-semibold text-primary">
+                  Sell to broker
+                </div>
+                <div className="font-mono tabular text-ink font-semibold text-[1.0625rem]">
+                  {fmtMoney(brokerQuote)}
+                </div>
               </div>
-              <input
-                type="range"
-                min={minPrice}
-                max={maxPrice}
-                step={100_000}
-                value={clamped}
-                onChange={(e) => setSellState({ ...sellState, price: parseInt(e.target.value, 10) })}
-                className="w-full accent-primary"
-              />
-              <div className="flex items-baseline justify-between text-[0.6875rem] text-ink-muted tabular font-mono">
-                <span>Min {fmtMoney(minPrice)} <span className="text-ink-muted/70">· 20% book</span></span>
-                <span><span className="text-ink-muted/70">120% market ·</span> Max {fmtMoney(maxPrice)}</span>
-              </div>
-              <div className="text-[0.625rem] text-ink-muted tabular font-mono">
-                Reference · book {fmtMoney(sellState.bookValue)} · market {fmtMoney(sellState.marketValue)} · broker threshold {fmtMoney(brokerThreshold)}
+              <div className="text-[0.8125rem] text-ink-2 leading-snug mt-1.5">
+                The broker pays a fixed {fmtMoney(brokerQuote)} (50% of book) in cash this quarter,
+                then re-lists the airframe on the open market.
               </div>
             </div>
 
-            {/* Phase E — outcome preview. Two cards, only one
-                "active" based on where the slider lands. The
-                broker card glows when the asking is ≤ threshold;
-                the marketplace card glows above. Keeps the player
-                informed about which path they're choosing without
-                making them read fine print. */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <div className={cn(
-                "rounded-md border p-3 transition-colors",
-                isBrokerSale
-                  ? "border-warning bg-[var(--warning-soft)]"
-                  : "border-line bg-surface-2/30 opacity-60",
-              )}>
-                <div className="text-[0.625rem] uppercase tracking-wider font-semibold text-warning mb-1">
-                  Broker instant buy {isBrokerSale && "· selected"}
+            {/* Salvage — the off-market alternative. Half the broker
+                quote; the airframe is scrapped and never reappears. */}
+            <div className="rounded-md border border-line bg-surface-2/40 p-3.5">
+              <div className="flex items-baseline justify-between">
+                <div className="text-[0.625rem] uppercase tracking-wider font-semibold text-ink-muted">
+                  Salvage
                 </div>
-                <div className="text-[0.8125rem] text-ink-2 leading-snug">
-                  At or below 75% of book ({fmtMoney(brokerThreshold)}), the broker takes the plane immediately.
-                  You get the cash this quarter; broker re-lists at full book.
+                <div className="font-mono tabular text-ink-2 font-semibold text-[1.0625rem]">
+                  {fmtMoney(salvageQuote)}
                 </div>
-                {isBrokerSale && (
-                  <div className="mt-2 text-[0.75rem] text-ink-2 tabular font-mono">
-                    Realised loss: <span className="text-negative font-semibold">−{fmtMoney(realisedLoss)}</span>
-                    <span className="text-ink-muted ml-1">({realisedLossPct.toFixed(0)}% of book)</span>
-                  </div>
-                )}
               </div>
-              <div className={cn(
-                "rounded-md border p-3 transition-colors",
-                !isBrokerSale
-                  ? "border-primary bg-[var(--accent-soft)]"
-                  : "border-line bg-surface-2/30 opacity-60",
-              )}>
-                <div className="text-[0.625rem] uppercase tracking-wider font-semibold text-primary mb-1">
-                  Marketplace listing {!isBrokerSale && "· selected"}
-                </div>
-                <div className="text-[0.8125rem] text-ink-2 leading-snug">
-                  Above 75% of book, the plane sits on the open market under your airline name. Clears when another player buys at your price.
-                </div>
-                {!isBrokerSale && (
-                  <div className="mt-2 text-[0.75rem] text-ink-2 tabular font-mono">
-                    May take 1–3 quarters to clear. No cash until a buyer accepts.
-                  </div>
-                )}
+              <div className="text-[0.8125rem] text-ink-2 leading-snug mt-1.5">
+                Scrap the airframe for {fmtMoney(salvageQuote)} (half the broker quote). It leaves the
+                game entirely — no one else can buy it.
               </div>
             </div>
           </ModalBody>
           <ModalFooter>
             <Button variant="ghost" onClick={() => setSellState(null)}>Cancel</Button>
             <Button
-              variant="primary"
+              variant="ghost"
               onClick={() => {
-                const r = s.listSecondHand(sellState.aircraftId, clamped);
+                const r = s.salvageAircraft(sellState.aircraftId);
                 if (!r.ok) {
-                  toast.negative("Listing failed", r.error ?? "Could not list this aircraft for sale.");
+                  toast.negative("Salvage failed", r.error ?? "Could not salvage this aircraft.");
                   return;
                 }
                 setSellState(null);
               }}
             >
-              {isBrokerSale
-                ? `Sell to broker · ${fmtMoney(clamped)}`
-                : `List at ${fmtMoney(clamped)}`}
+              Salvage · {fmtMoney(salvageQuote)}
+            </Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                const r = s.sellToBroker(sellState.aircraftId);
+                if (!r.ok) {
+                  toast.negative("Sale failed", r.error ?? "Could not sell this aircraft.");
+                  return;
+                }
+                setSellState(null);
+              }}
+            >
+              Sell to broker · {fmtMoney(brokerQuote)}
             </Button>
           </ModalFooter>
         </Modal>
@@ -1449,12 +1406,14 @@ function RetiredHistory() {
     sold: "Sold",
     "lease-returned": "Lease returned",
     crashed: "Crashed",
+    scrapped: "Salvaged",
   };
   const reasonTone: Record<typeof history[number]["exitReason"], string> = {
     retired: "text-ink-muted",
     sold: "text-positive",
     "lease-returned": "text-warning",
     crashed: "text-negative",
+    scrapped: "text-ink-muted",
   };
 
   return (
