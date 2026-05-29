@@ -2120,9 +2120,47 @@ export function computeRouteEconomics(
   // Now each class has its own demand pool; capacity clamps per class;
   // yield management lifts each class's fare independently.
   const shares = classDemandShares(distanceKm, origin.tier, dest.tier);
-  const dailyDemandFirst = effectiveDemand * shares.first;
-  const dailyDemandBus   = effectiveDemand * shares.bus;
-  const dailyDemandEcon  = effectiveDemand * shares.econ;
+
+  // Pricing-tier multiplier — hoisted above the demand pools so price
+  // elasticity (below) can compare the chosen fare to the standard fare.
+  const tier = PRICE_TIER[route.pricingTier];
+
+  // ── Price elasticity of demand (realism fix — P1/P2) ───────
+  // The model previously had yield management (fares rise when a cabin
+  // is oversold) but NO elasticity (demand never fell when the player
+  // raised fares). That let a player set Ultra pricing (2.0× the
+  // standard fare) and STILL fill 100% of seats — doubling revenue for
+  // free. Aggregate fuel collapsed to ~3% of revenue, net margins ran
+  // ~47%, and a plane paid back its purchase in 1-2 quarters. Real
+  // airlines lose passengers when they price above the market.
+  //
+  // We compare the player's chosen fare (pricing tier × distance curve,
+  // or a manual per-route override) against the STANDARD-tier fare for
+  // the same distance, and bend each cabin's demand by that ratio
+  // raised to a negative elasticity exponent. Economy is the most
+  // price-sensitive (leisure/price-shoppers), first the least
+  // (corporate/last-minute). At STANDARD tier with no override the
+  // ratio is exactly 1.0 → multiplier 1.0 → balanced play is untouched;
+  // only fare-tier exploitation is disciplined. Clamped so a deep
+  // discount can't manufacture infinite demand, nor a high fare zero it.
+  const stdEconBase  = classFareRange(distanceKm, "econ").base;
+  const stdBusBase   = classFareRange(distanceKm, "bus").base;
+  const stdFirstBase = classFareRange(distanceKm, "first").base;
+  const chosenEconBase  = route.econFare  ?? stdEconBase  * tier;
+  const chosenBusBase   = route.busFare   ?? stdBusBase   * tier;
+  const chosenFirstBase = route.firstFare ?? stdFirstBase * tier;
+  const elasticityMult = (chosen: number, std: number, magnitude: number) =>
+    std <= 0 || chosen <= 0 ? 1 : clamp(0.15, 3.0, Math.pow(chosen / std, -magnitude));
+  const ELASTICITY_ECON  = 1.3;
+  const ELASTICITY_BUS   = 0.6;
+  const ELASTICITY_FIRST = 0.4;
+
+  const dailyDemandFirst = effectiveDemand * shares.first *
+    elasticityMult(chosenFirstBase, stdFirstBase, ELASTICITY_FIRST);
+  const dailyDemandBus   = effectiveDemand * shares.bus *
+    elasticityMult(chosenBusBase, stdBusBase, ELASTICITY_BUS);
+  const dailyDemandEcon  = effectiveDemand * shares.econ *
+    elasticityMult(chosenEconBase, stdEconBase, ELASTICITY_ECON);
 
   const dailyCapacityFirst = seatsPerFlight.first * route.dailyFrequency;
   const dailyCapacityBus   = seatsPerFlight.bus   * route.dailyFrequency;
@@ -2195,7 +2233,7 @@ export function computeRouteEconomics(
     dailyCapacity > 0 ? Math.max(0, Math.min(1.0, dailyPax / dailyCapacity)) : 0;
 
   // ─ Per-class fares (A7 + A11) ──────────────────────────
-  const tier = PRICE_TIER[route.pricingTier];
+  // `tier` is hoisted above the demand pools (price elasticity needs it).
   let econFare = route.econFare ?? classFareRange(distanceKm, "econ").base * tier;
   let busFare = route.busFare ?? classFareRange(distanceKm, "bus").base * tier;
   let firstFare = route.firstFare ?? classFareRange(distanceKm, "first").base * tier;
