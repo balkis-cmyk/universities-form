@@ -34,6 +34,25 @@ export const PREMIUM_PRICE_THRESHOLD_USD = 100_000_000;
 export const DEFAULT_PRODUCTION_CAP = 8;
 export const PREMIUM_PRODUCTION_CAP = 3;
 
+/** Widebody buy-price threshold for delivery lead time. Distinct from the
+ *  production-cap threshold ($100M): the cap governs how scarce the line is,
+ *  the lead time governs how long the airframe takes to BUILD once your slot
+ *  comes up. The catalog splits cleanly at $150M — every passenger widebody
+ *  (A330/777/787/A350/A380/747) and heavy freighter lists at or above this,
+ *  every narrowbody (A320/737/A220/E-jets/regional) below it. */
+export const WIDEBODY_PRICE_THRESHOLD_USD = 150_000_000;
+/** Larger airframes take 2 quarters from order to delivery; smaller planes 1. */
+export const WIDEBODY_LEAD_QUARTERS = 2;
+export const NARROWBODY_LEAD_QUARTERS = 1;
+
+/** Build lead time, in quarters, between an order being placed (or reaching
+ *  the head of the FIFO queue) and the airframe rolling off the line. */
+export function deliveryLeadQuarters(spec: AircraftSpec): number {
+  return spec.buyPriceUsd >= WIDEBODY_PRICE_THRESHOLD_USD
+    ? WIDEBODY_LEAD_QUARTERS
+    : NARROWBODY_LEAD_QUARTERS;
+}
+
 export function effectiveProductionCap(
   spec: AircraftSpec,
   overrides: Record<string, number>,
@@ -109,10 +128,19 @@ export function estimatedDeliveryQuarter(
 ): number {
   const cap = effectiveProductionCap(spec, overrides);
   const pos = queuePosition(orders, order.id) ?? 1;
-  // Earliest possible delivery round = effective unlock quarter (announcements
-  // open ahead of unlock so pre-unlock orders all wait). In the full campaign
-  // the unlock is clamped to the airframe's real entry-into-service era.
-  const startRound = Math.max(currentQuarter + 1, effectiveUnlockQuarter(spec, campaignMode));
+  // Earliest possible delivery round = order quarter + build lead time, but no
+  // sooner than the effective unlock quarter (announcements open ahead of
+  // unlock so pre-unlock orders all wait). In the full campaign the unlock is
+  // clamped to the airframe's real entry-into-service era. Widebodies carry a
+  // 2-quarter lead; narrowbodies 1 — so even at the head of an empty queue a
+  // widebody can't arrive next round.
+  const lead = deliveryLeadQuarters(spec);
+  const earliestByLead = order.orderedAtQuarter + lead;
+  const startRound = Math.max(
+    currentQuarter + 1,
+    earliestByLead,
+    effectiveUnlockQuarter(spec, campaignMode),
+  );
   // pos=1 → delivers startRound; pos=cap → delivers startRound; pos=cap+1 → startRound+1; etc.
   const offset = Math.max(0, Math.floor((pos - 1) / cap));
   return startRound + offset;

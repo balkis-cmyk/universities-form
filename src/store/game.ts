@@ -59,6 +59,7 @@ import {
   PREORDER_DEPOSIT_PCT,
   PREORDER_CANCEL_PENALTY_PCT,
   effectiveProductionCap,
+  deliveryLeadQuarters,
   isAnnouncementOpen,
   isReleased,
   queuedForSpec,
@@ -1812,8 +1813,13 @@ export const useGame = create<GameStore>()(
         // only happens if the queue is empty AND room remains in this round.
         const queueAhead = queuedForSpec(s.preOrders, specId).length;
 
+        // Build lead time: narrowbodies can ship the same round they're
+        // ordered (instant walk-up), widebodies always take ≥2 quarters and
+        // therefore never qualify for instant delivery — they join the queue
+        // and surface with a 2-quarter ETA.
+        const lead = deliveryLeadQuarters(spec);
         let instantQty = 0;
-        if (released && queueAhead === 0) {
+        if (released && queueAhead === 0 && lead <= 1) {
           instantQty = Math.min(qty, Math.max(0, cap - deliveredThisRound));
         }
         const queuedQty = qty - instantQty;
@@ -5591,6 +5597,12 @@ export const useGame = create<GameStore>()(
         // still completes the quarter; one bot just stays put for
         // a round (which is the same observable behaviour as a
         // human player who didn't take any actions).
+        // Bots place aircraft orders into the SAME global FIFO production
+        // queue the player uses. Collected here during the reduce and merged
+        // into the pre-order array before the quarter-close delivery batch, so
+        // bots respect per-spec production caps, wait their turn behind the
+        // player's deposited slots, and show up in Market Intel's order book.
+        const botPreOrders: PreOrder[] = [];
         const { teams: teamsAfterBotTurns } = s.teams.reduce<{
           teams: typeof s.teams;
           claimedODs: Set<string>;
@@ -5845,38 +5857,32 @@ export const useGame = create<GameStore>()(
                   acquisitionType = "buy";
                 }
                 const leaseTerms = leaseTermsFor(spec);
-                const perPlaneCost = acquisitionType === "buy"
+                // Total contract value per plane mirrors the player flow:
+                // buy = sticker, lease = the upfront deposit. The 20% order
+                // deposit is charged now; the balance is charged on delivery
+                // by deliverPreOrders, identical to a human's pre-order.
+                const totalPerPlane = acquisitionType === "buy"
                   ? spec.buyPriceUsd
                   : leaseTerms.depositUsd;
-                const totalCost = perPlaneCost * order.quantity;
-                if (updated.cashUsd >= totalCost) {
-                  const newPlanes: FleetAircraft[] = Array.from({ length: order.quantity }, () => ({
-                    id: mkId("ac"),
-                    specId: order.specId,
-                    status: "ordered",
-                    acquisitionType,
-                    purchaseQuarter: s.currentQuarter,
-                    purchasePrice: acquisitionType === "buy" ? spec.buyPriceUsd : 0,
-                    bookValue: acquisitionType === "buy" ? spec.buyPriceUsd : 0,
-                    leaseQuarterly: acquisitionType === "lease" ? leaseTerms.perQuarterUsd : null,
-                    leaseDepositUsd: acquisitionType === "lease" ? leaseTerms.depositUsd : undefined,
-                    leaseTermEndsAtQuarter: acquisitionType === "lease"
-                      ? s.currentQuarter + leaseTerms.termQuarters - 1
-                      : undefined,
-                    leaseBuyoutBasisUsd: acquisitionType === "lease" ? spec.buyPriceUsd : undefined,
-                    ecoUpgrade: false,
-                    ecoUpgradeQuarter: null,
-                    ecoUpgradeCost: 0,
-                    cabinConfig: "default",
-                    routeId: null,
-                    retirementQuarter: s.currentQuarter + 28,
-                    maintenanceDeficit: 0,
-                    satisfactionPct: 75,
-                  }));
+                const depositPerPlane = totalPerPlane * PREORDER_DEPOSIT_PCT;
+                const depositTotal = depositPerPlane * order.quantity;
+                if (updated.cashUsd >= depositTotal) {
+                  for (let i = 0; i < order.quantity; i++) {
+                    botPreOrders.push({
+                      id: mkId("po"),
+                      teamId: t.id,
+                      specId: order.specId,
+                      orderedAtQuarter: s.currentQuarter,
+                      depositUsd: depositPerPlane,
+                      totalPriceUsd: totalPerPlane,
+                      acquisitionType,
+                      cabinConfig: "default",
+                      status: "queued",
+                    });
+                  }
                   updated = {
                     ...updated,
-                    cashUsd: updated.cashUsd - totalCost,
-                    fleet: [...updated.fleet, ...newPlanes],
+                    cashUsd: updated.cashUsd - depositTotal,
                   };
                 }
               }
@@ -6623,9 +6629,16 @@ export const useGame = create<GameStore>()(
         // actually reached unlockQuarter. Pre-orders placed during the
         // announcement window (R-2) sit in the queue until unlock.
         const deliveriesToMake: PreOrder[] = [];
-        const queuedNow = teamsWithAwards.length === 0
-          ? s.preOrders
+        // Merge this round's bot pre-orders into the global queue so bot
+        // airframes draw from the SAME per-spec FIFO line as the player.
+        // Without this merge bots would jump the queue (the bug behind
+        // both the Market-Intel "only my orders show" and the FIFO-leak
+        // reports: a player who deposits 20 A380s must be served before a
+        // bot that ordered later).
+        const allPreOrdersNow = botPreOrders.length > 0
+          ? [...s.preOrders, ...botPreOrders]
           : s.preOrders;
+        const queuedNow = allPreOrdersNow;
         const seenSpecs = new Set<string>();
         for (const order of queuedNow) {
           if (order.status !== "queued") continue;
@@ -6644,11 +6657,20 @@ export const useGame = create<GameStore>()(
           ).length;
           const remainingCap = Math.max(0, cap - alreadyThisRound);
           if (remainingCap === 0) continue;
-          const queueSlice = queuedForSpec(queuedNow, spec.id).slice(0, remainingCap);
+          // Variable build lead time: widebodies (≥$150M) take 2 quarters
+          // from order to roll-off, narrowbodies 1. An order is only
+          // eligible for this quarter's batch once it has aged the spec's
+          // full lead. Eligibility is monotonic with order age, so
+          // filtering before the FIFO slice preserves queue order.
+          const lead = deliveryLeadQuarters(spec);
+          const eligible = queuedForSpec(queuedNow, spec.id).filter(
+            (o) => s.currentQuarter - o.orderedAtQuarter >= lead - 1,
+          );
+          const queueSlice = eligible.slice(0, remainingCap);
           deliveriesToMake.push(...queueSlice);
         }
         const { newPreOrders: preOrdersAfterDelivery, teamUpdates: teamsAfterDelivery } =
-          deliverPreOrders(s.preOrders, teamsWithAwards, deliveriesToMake, s.currentQuarter);
+          deliverPreOrders(allPreOrdersNow, teamsWithAwards, deliveriesToMake, s.currentQuarter);
         if (deliveriesToMake.length > 0) {
           // Group by team for one toast per team.
           const byTeam = new Map<string, number>();
