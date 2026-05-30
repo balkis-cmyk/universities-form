@@ -10,7 +10,7 @@ import { toast } from "@/store/toasts";
 import { fmtMoney, fmtPct, fmtAgeYQ, fmtQuarter } from "@/lib/format";
 import { planeImagePath } from "@/lib/aircraft-images";
 import { cn } from "@/lib/cn";
-import { Plane, AlertTriangle, Clock, X } from "lucide-react";
+import { Plane, AlertTriangle, Clock, X, ChevronRight, Copy, Wrench, Tag, Trash2, type LucideIcon } from "lucide-react";
 import { discontinuedMaintenanceBracket, effectiveUnlockQuarter, effectiveCutoffRound, brokerResaleQuoteUsd, salvageQuoteUsd } from "@/lib/engine";
 import {
   effectiveProductionCap,
@@ -161,6 +161,9 @@ export function FleetPanel() {
    *  the same spec. */
   const [agingOpen, setAgingOpen] = useState(false);
   const [marketQuery, setMarketQuery] = useState("");
+  /** Per-tail expand state inside the spec modal's compact fleet table.
+   *  Only one airframe's action drawer is open at a time. */
+  const [openTail, setOpenTail] = useState<string | null>(null);
 
   const groups = useMemo(() => groupByType(player, s.currentQuarter), [player, s.currentQuarter]);
 
@@ -587,11 +590,23 @@ export function FleetPanel() {
               </div>
             </div>
           </ModalHeader>
-          <ModalBody className="max-h-[60vh] overflow-auto space-y-3">
-            {/* Per-plane card list — replaces the previous cramped 8-column
-                table. Each card has the tail, status, current route, age,
-                book value, satisfaction on top — and the action set as
-                proper buttons in a tidy row. */}
+          <ModalBody className="max-h-[60vh] overflow-auto p-0">
+            {/* Compact one-row-per-tail table. Each tail is a single dense
+                row (status dot · tail · route · age-left · sat · book value);
+                clicking a row expands an inline drawer with full detail, the
+                customisations chip strip, and compact lifecycle actions.
+                Only one drawer is open at a time (openTail). This replaces the
+                previous full-height card-per-tail list that buried an 86-tail
+                fleet under endless scroll. */}
+            <div className="sticky top-0 z-10 grid grid-cols-[1.25rem_6.5rem_1fr_5rem] sm:grid-cols-[1.25rem_7rem_1fr_4.5rem_3rem_6rem] items-center gap-2 px-4 py-2 bg-surface-2/70 backdrop-blur border-b border-line text-[0.625rem] uppercase tracking-wider text-ink-muted">
+              <span />
+              <span>Tail</span>
+              <span>Route &amp; flags</span>
+              <span className="hidden sm:block text-right">Life left</span>
+              <span className="hidden sm:block text-right">Sat.</span>
+              <span className="text-right">Book value</span>
+            </div>
+            <div className="divide-y divide-line/50">
             {expandedFleet.map((f) => {
               const route = player.routes.find((r) => r.id === f.routeId);
               const ageQ = Math.max(0, s.currentQuarter - f.purchaseQuarter);
@@ -601,118 +616,59 @@ export function FleetPanel() {
                 sat < 30 ? "text-negative" :
                 sat < 50 ? "text-warning" :
                 sat >= 80 ? "text-positive" : "text-ink";
+              const tail = f.id.slice(-6).toUpperCase();
+              const isOpen = openTail === f.id;
+              const statusDot =
+                f.status === "active" ? "bg-positive" :
+                f.status === "retired" ? "bg-negative" :
+                f.status === "ordered" ? "bg-info" : "bg-warning";
               return (
-                <div
-                  key={f.id}
-                  className="rounded-lg border border-line bg-surface p-4"
-                >
-                  {/* Top row — tail + badges + status, route, key stats */}
-                  <div className="flex items-start justify-between gap-3 flex-wrap">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-[0.9375rem] text-ink font-semibold tracking-wide">
-                        {f.id.slice(-6).toUpperCase()}
-                      </span>
-                      <Badge
-                        tone={
-                          f.status === "active" ? "positive" :
-                          f.status === "retired" ? "negative" :
-                          f.status === "ordered" ? "info" : "warning"
-                        }
-                      >
-                        {f.status}
-                      </Badge>
-                      {/* Pre-order ETA (Phase 2 — P1-13e). For ordered
-                          aircraft, f.purchaseQuarter holds the projected
-                          delivery round. Pre-fix the badge just said
-                          "ordered" with no signal about WHEN it arrived
-                          — players had to open the pre-order queue
-                          modal to see the ETA. Surface it inline. */}
-                      {f.status === "ordered" && f.purchaseQuarter > s.currentQuarter && (() => {
-                        const qOut = f.purchaseQuarter - s.currentQuarter;
-                        return (
-                          <Badge
-                            tone="info"
-                            title={`Projected delivery: Q${f.purchaseQuarter}. ${qOut} quarter${qOut === 1 ? "" : "s"} until the airframe enters service.`}
-                          >
-                            ETA Q{f.purchaseQuarter} · {qOut}Q out
-                          </Badge>
-                        );
-                      })()}
-                      {f.ecoUpgrade && <Badge tone="positive">Eco</Badge>}
-                      {f.engineUpgrade && (
-                        <Badge tone="info" title={`Engine retrofit: ${f.engineUpgrade}`}>
-                          {f.engineUpgrade === "fuel" ? "Fuel-eff" :
-                           f.engineUpgrade === "power" ? "Power" :
-                           f.engineUpgrade === "super" ? "Super" : ""}
-                        </Badge>
-                      )}
-                      {f.fuselageUpgrade && (
-                        <Badge tone="accent" title="Anti-drag fuselage coating">Fuselage</Badge>
-                      )}
-                      {f.customSeats && (
-                        <Badge tone="warning" title="Custom cabin layout">Custom cabin</Badge>
-                      )}
-                      {/* Per-tail aging warning — surfaces individual
-                          airframes within 4 quarters of mandatory
-                          retirement. The top-of-panel KPI card counts
-                          aging-by-spec, but the player needs the
-                          per-tail signal to decide which specific
-                          plane to refit, reassign, or replace.
-                          Pre-fix this lived only on the spec-group
-                          row + the Aging modal; this badge surfaces
-                          it inline. */}
-                      {f.status === "active" && remainingQ > 0 && remainingQ <= 4 && (
-                        <Badge
-                          tone="warning"
-                          title={`Retires in ${remainingQ} quarter${remainingQ === 1 ? "" : "s"} (Q${f.retirementQuarter}). Order a replacement or apply a lifespan refit if eligible.`}
-                        >
-                          Aging · retires Q{f.retirementQuarter}
-                        </Badge>
-                      )}
-                      {f.status === "active" && remainingQ === 0 && (
-                        <Badge
-                          tone="negative"
-                          title="Retires at this quarter close. Any routes assigned to this plane will be left without aircraft unless a replacement is staged."
-                        >
-                          Retiring this quarter
-                        </Badge>
-                      )}
-                    </div>
-                    <div className="text-[0.75rem] text-ink-muted flex items-center gap-1.5">
+                <div key={f.id} className={cn(isOpen && "bg-surface-2/30")}>
+                  {/* ── Compact row — click to expand ───────────────────── */}
+                  <button
+                    type="button"
+                    onClick={() => setOpenTail(isOpen ? null : f.id)}
+                    aria-expanded={isOpen}
+                    title={isOpen ? "Collapse" : "Expand for detail & actions"}
+                    className="w-full grid grid-cols-[1.25rem_6.5rem_1fr_5rem] sm:grid-cols-[1.25rem_7rem_1fr_4.5rem_3rem_6rem] items-center gap-2 px-4 py-2 text-left hover:bg-surface-hover transition-colors"
+                  >
+                    <ChevronRight className={cn("w-4 h-4 text-ink-muted transition-transform", isOpen && "rotate-90")} />
+                    <span className="flex items-center gap-1.5 min-w-0">
+                      <span className={cn("w-1.5 h-1.5 rounded-full shrink-0", statusDot)} />
+                      <span className="font-mono text-[0.8125rem] text-ink font-semibold tracking-wide truncate">{tail}</span>
+                    </span>
+                    <span className="flex items-center gap-1 min-w-0 text-[0.75rem] text-ink-muted overflow-hidden">
                       {route ? (
-                        <>
-                          <span className="font-mono text-ink-2">
-                            {route.originCode} → {route.destCode}
-                          </span>
-                          {/* Phase 6 P2 — pending-route visibility.
-                              Aircraft on pending-bid routes look like
-                              they're flying but earn nothing until
-                              the slot auction resolves. Surface a
-                              pill so the player understands why. */}
-                          {route.status === "pending" && (
-                            <span
-                              className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider bg-amber-50 text-amber-700"
-                              title="Route is in a pending slot auction — aircraft is reserved but earns no revenue until the bid resolves."
-                            >
-                              Pending bid
-                            </span>
-                          )}
-                          {route.status === "suspended" && (
-                            <span
-                              className="px-1.5 py-0.5 rounded-full text-[10px] font-semibold uppercase tracking-wider bg-slate-100 text-slate-600"
-                              title="Route is suspended — aircraft is reserved but not flying."
-                            >
-                              Suspended
-                            </span>
-                          )}
-                        </>
+                        <span className="font-mono text-ink-2 truncate shrink-0">{route.originCode} → {route.destCode}</span>
                       ) : (
-                        <span className="italic">Idle — assign to a route</span>
+                        <span className="italic shrink-0">Idle</span>
                       )}
-                    </div>
-                  </div>
-                  {/* 4-up stat strip — clearer than the 8-col table */}
-                  <div className="mt-3 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[0.75rem]">
+                      {f.status === "ordered" && f.purchaseQuarter > s.currentQuarter && (
+                        <FlagChip tone="info" title={`Projected delivery Q${f.purchaseQuarter}`}>ETA Q{f.purchaseQuarter}</FlagChip>
+                      )}
+                      {route?.status === "pending" && <FlagChip tone="warning" title="In a pending slot auction — earns no revenue until it resolves.">Pending</FlagChip>}
+                      {route?.status === "suspended" && <FlagChip tone="muted" title="Route suspended — reserved but not flying.">Susp</FlagChip>}
+                      {f.status === "active" && remainingQ > 0 && remainingQ <= 4 && <FlagChip tone="warning" title={`Retires in ${remainingQ}Q (Q${f.retirementQuarter}).`}>Aging</FlagChip>}
+                      {f.status === "active" && remainingQ === 0 && <FlagChip tone="negative" title="Retires at this quarter close.">Retiring</FlagChip>}
+                      {f.ecoUpgrade && <FlagChip tone="positive" title="Eco engine retrofit">Eco</FlagChip>}
+                      {f.engineUpgrade && (
+                        <FlagChip tone="info" title={`Engine retrofit: ${f.engineUpgrade}`}>
+                          {f.engineUpgrade === "fuel" ? "Fuel" : f.engineUpgrade === "power" ? "Power" : f.engineUpgrade === "super" ? "Super" : "Eng"}
+                        </FlagChip>
+                      )}
+                      {f.fuselageUpgrade && <FlagChip tone="accent" title="Anti-drag fuselage coating">Fus</FlagChip>}
+                      {f.customSeats && <FlagChip tone="muted" title="Custom cabin layout">Cabin</FlagChip>}
+                    </span>
+                    <span className="hidden sm:block font-mono tabular text-[0.75rem] text-ink-muted text-right">{fmtAgeYQ(remainingQ)}</span>
+                    <span className={cn("hidden sm:block font-mono tabular text-[0.75rem] text-right", satTone)}>{sat}%</span>
+                    <span className="font-mono tabular text-[0.75rem] text-ink text-right truncate">{fmtMoney(f.bookValue)}</span>
+                  </button>
+
+                  {/* ── Expanded drawer — full detail + actions ─────────── */}
+                  {isOpen && (
+                  <div className="px-4 pb-4 pt-1">
+                  {/* 4-up stat strip — full detail for the expanded tail */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[0.75rem]">
                     <div className="rounded-md bg-surface-2/40 border border-line/60 px-2 py-1.5">
                       <div className="text-[0.625rem] uppercase tracking-wider text-ink-muted">Age</div>
                       <div className="font-mono tabular text-ink mt-0.5">
@@ -847,95 +803,88 @@ export function FleetPanel() {
                     </div>
                   )}
 
-                  {/* PROMINENT lifecycle CTAs — these are the high-stakes
-                      decisions and get their own visual weight. The
-                      fleet table already filters retired planes out, so
-                      every row here is at least retire-able. */}
+                  {/* Lifecycle decisions — compact icon actions. These are
+                      the high-stakes calls (order / renovate / sell / retire);
+                      they read as a tidy button row instead of the previous
+                      oversized cards now that full detail lives in the drawer
+                      above. */}
                   <div className="mt-3 pt-3 border-t border-line/60">
-                      <div className="text-[0.625rem] uppercase tracking-wider text-ink-muted mb-2">
-                        Lifecycle decisions
-                      </div>
-                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                        <button
-                          onClick={() => {
-                            setExpandedSpecId(null);
-                            // Clone this exact airframe's config into a
-                            // fresh buy order so "Order another" reproduces
-                            // the same cabin layout / amenities / belly
-                            // rather than opening a blank card.
-                            setOrdering({
-                              specId: expanded.id,
-                              type: "buy",
-                              prefill: {
-                                quantity: 1,
-                                engineUpgrade: f.engineUpgrade ?? null,
-                                fuselageUpgrade: !!f.fuselageUpgrade,
-                                customSeats: f.customSeats,
-                                cabinAmenities: f.cabinAmenities,
-                                cargoBelly: f.cargoBelly,
-                              },
-                            });
-                          }}
-                          className="rounded-lg border border-accent/40 bg-accent/5 hover:bg-accent/10 text-left px-3 py-2.5 transition-colors"
-                        >
-                          <div className="text-[0.8125rem] font-semibold text-ink">Order another</div>
-                          <div className="text-[0.6875rem] text-ink-muted mt-0.5">
-                            Same config · buy {fmtMoney(expanded.buyPriceUsd)}
-                          </div>
-                        </button>
-                        {f.acquisitionType === "buy" && f.status === "active" && (
-                          <button
-                            onClick={() => setRetrofitState({
-                              kind: "fullReno",
-                              aircraftId: f.id,
-                              name: expanded.name,
-                              tail: f.id.slice(-6).toUpperCase(),
-                              costUsd: Math.round(Math.max(f.bookValue * 0.20, f.purchasePrice * 0.05)),
-                              cabinConfig: f.cabinConfig,
-                              effectLine: "+8Q lifespan · 1Q downtime · airframe refurb",
-                            })}
-                            title={`Full renovation · ${fmtMoney(Math.max(f.bookValue * 0.20, f.purchasePrice * 0.05))} · +8Q lifespan, 1Q downtime`}
-                            className="rounded-lg border border-accent/40 bg-accent/5 hover:bg-accent/10 text-left px-3 py-2.5 transition-colors"
-                          >
-                            <div className="text-[0.8125rem] font-semibold text-ink">Renovate</div>
-                            <div className="text-[0.6875rem] text-ink-muted mt-0.5">
-                              +8Q lifespan · 1Q downtime · {fmtMoney(Math.max(f.bookValue * 0.20, f.purchasePrice * 0.05))}
-                            </div>
-                          </button>
-                        )}
-                        {f.acquisitionType === "buy" && f.status === "active" && (
-                          <button
-                            onClick={() => setSellState({
-                              aircraftId: f.id,
-                              bookValue: f.bookValue,
-                              name: expanded.name,
-                            })}
-                            className="rounded-lg border border-line hover:border-ink-muted bg-surface hover:bg-surface-hover text-left px-3 py-2.5 transition-colors"
-                          >
-                            <div className="text-[0.8125rem] font-semibold text-ink">Sell</div>
-                            <div className="text-[0.6875rem] text-ink-muted mt-0.5">
-                              Broker quotes a fixed price
-                            </div>
-                          </button>
-                        )}
-                        <button
-                          onClick={() => setRetireState({
+                    <div className="text-[0.625rem] uppercase tracking-wider text-ink-muted mb-2">
+                      Lifecycle decisions
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <RowAction
+                        icon={Copy}
+                        label="Order another"
+                        tone="accent"
+                        title={`Order another ${expanded.name} · same config · ${fmtMoney(expanded.buyPriceUsd)}`}
+                        onClick={() => {
+                          setExpandedSpecId(null);
+                          // Clone this exact airframe's config into a fresh buy
+                          // order so "Order another" reproduces the same cabin
+                          // layout / amenities / belly rather than a blank card.
+                          setOrdering({
+                            specId: expanded.id,
+                            type: "buy",
+                            prefill: {
+                              quantity: 1,
+                              engineUpgrade: f.engineUpgrade ?? null,
+                              fuselageUpgrade: !!f.fuselageUpgrade,
+                              customSeats: f.customSeats,
+                              cabinAmenities: f.cabinAmenities,
+                              cargoBelly: f.cargoBelly,
+                            },
+                          });
+                        }}
+                      />
+                      {f.acquisitionType === "buy" && f.status === "active" && (
+                        <RowAction
+                          icon={Wrench}
+                          label="Renovate"
+                          tone="accent"
+                          title={`Full renovation · ${fmtMoney(Math.max(f.bookValue * 0.20, f.purchasePrice * 0.05))} · +8Q lifespan, 1Q downtime`}
+                          onClick={() => setRetrofitState({
+                            kind: "fullReno",
                             aircraftId: f.id,
                             name: expanded.name,
-                            tail: f.id.slice(-6).toUpperCase(),
+                            tail,
+                            costUsd: Math.round(Math.max(f.bookValue * 0.20, f.purchasePrice * 0.05)),
+                            cabinConfig: f.cabinConfig,
+                            effectLine: "+8Q lifespan · 1Q downtime · airframe refurb",
                           })}
-                          className="rounded-lg border border-negative/30 hover:border-negative/60 bg-[var(--negative-soft)]/40 hover:bg-[var(--negative-soft)] text-left px-3 py-2.5 transition-colors text-negative"
-                        >
-                          <div className="text-[0.8125rem] font-semibold">Retire</div>
-                          <div className="text-[0.6875rem] opacity-80 mt-0.5">
-                            Permanent · removes from fleet
-                          </div>
-                        </button>
-                      </div>
+                        />
+                      )}
+                      {f.acquisitionType === "buy" && f.status === "active" && (
+                        <RowAction
+                          icon={Tag}
+                          label="Sell"
+                          title="Broker quotes a fixed price"
+                          onClick={() => setSellState({
+                            aircraftId: f.id,
+                            bookValue: f.bookValue,
+                            name: expanded.name,
+                          })}
+                        />
+                      )}
+                      <RowAction
+                        icon={Trash2}
+                        label="Retire"
+                        tone="danger"
+                        title="Permanent · removes from fleet"
+                        onClick={() => setRetireState({
+                          aircraftId: f.id,
+                          name: expanded.name,
+                          tail,
+                        })}
+                      />
                     </div>
+                  </div>
+                  </div>
+                  )}
                 </div>
               );
             })}
+            </div>
           </ModalBody>
           <ModalFooter>
             <Button variant="ghost" onClick={() => setExpandedSpecId(null)}>Close</Button>
@@ -1249,6 +1198,70 @@ function Th({
 // fmtPct is imported lazily only when needed for occupancy on cargo planes —
 // the unused import is suppressed by tsc since we reference it elsewhere.
 void fmtPct;
+
+/** Tiny inline status chip used in the compact fleet table rows. Soft
+ *  ICAN-brand tints (emerald/amber/rose/sky/teal/slate) — no heavy fills,
+ *  no dark chrome. Stays one-line; truncates gracefully in a dense row. */
+function FlagChip({
+  tone, title, children,
+}: {
+  tone: "info" | "warning" | "negative" | "positive" | "accent" | "muted";
+  title?: string;
+  children: React.ReactNode;
+}) {
+  const tones: Record<string, string> = {
+    info: "bg-sky-50 text-sky-700",
+    warning: "bg-amber-50 text-amber-700",
+    negative: "bg-rose-50 text-rose-700",
+    positive: "bg-emerald-50 text-emerald-700",
+    accent: "bg-[#00C2CB]/10 text-[#00C2CB]",
+    muted: "bg-slate-100 text-slate-600",
+  };
+  return (
+    <span
+      title={title}
+      className={cn(
+        "shrink-0 px-1.5 py-0.5 rounded-full text-[0.625rem] font-semibold uppercase tracking-wide",
+        tones[tone],
+      )}
+    >
+      {children}
+    </span>
+  );
+}
+
+/** Compact lifecycle action button for the expanded-tail drawer. Replaces
+ *  the previous oversized outcome cards — an icon + label pill that keeps
+ *  the four high-stakes decisions readable without dominating the drawer. */
+function RowAction({
+  icon: Icon, label, tone = "default", title, onClick,
+}: {
+  icon: LucideIcon;
+  label: string;
+  tone?: "accent" | "default" | "danger";
+  title?: string;
+  onClick: () => void;
+}) {
+  const tones: Record<string, string> = {
+    accent: "border-accent/40 bg-accent/5 hover:bg-accent/10 text-ink",
+    default: "border-line hover:border-ink-muted bg-surface hover:bg-surface-hover text-ink",
+    danger: "border-negative/30 hover:border-negative/60 bg-[var(--negative-soft)]/40 hover:bg-[var(--negative-soft)] text-negative",
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={title}
+      className={cn(
+        "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-[0.75rem] font-medium transition-colors",
+        tones[tone],
+      )}
+    >
+      <Icon className="w-3.5 h-3.5 shrink-0" />
+      {label}
+    </button>
+  );
+}
 
 /** Pre-order queue display — shows the player's queued orders with
  *  position in the FIFO line and an estimated delivery quarter, plus
