@@ -2151,9 +2151,65 @@ export function computeRouteEconomics(
   const chosenFirstBase = route.firstFare ?? stdFirstBase * tier;
   const elasticityMult = (chosen: number, std: number, magnitude: number) =>
     std <= 0 || chosen <= 0 ? 1 : clamp(0.15, 3.0, Math.pow(chosen / std, -magnitude));
-  const ELASTICITY_ECON  = 1.3;
-  const ELASTICITY_BUS   = 0.6;
-  const ELASTICITY_FIRST = 0.4;
+
+  // ── Dynamic elasticity magnitude (P1/P2 follow-up) ─────────
+  // A fixed exponent was too crude: it punished a global-hub premium
+  // carrier with fierce loyalty exactly as hard as a budget carrier on a
+  // contested small-city leisure route. Real price tolerance is not a
+  // constant. We keep the per-cabin BASE magnitudes (economy most
+  // sensitive, first least) as a neutral mid-carrier baseline, then
+  // modulate every cabin by five real signals. A factor < 1 means LESS
+  // elastic (the airline can push Ultra fares and keep its seats); > 1
+  // means MORE elastic (raising fares bleeds passengers fast).
+  //
+  //   1. City tier   — tier-1 hubs carry captive corporate/premium demand
+  //                    (less elastic); tier-4 leisure markets price-shop
+  //                    (more elastic). Averaged across origin + dest.
+  //   2. Doctrine    — premium-service tolerates high fares (×0.65);
+  //                    budget-expansion is hyper price-sensitive (×1.35);
+  //                    global-network / cargo / connecting sit in the
+  //                    middle (×1.0).
+  //   3. Brand+loyalty — derived from the brand multiplier (which already
+  //                    folds customer loyalty). At A+ (m≥1.6) tolerance
+  //                    collapses to the floor → the airline "gets away
+  //                    with" Ultra pricing; a weak brand is punished
+  //                    harder than baseline.
+  //   4. Haul        — long-haul has fewer substitutes and more corporate
+  //                    demand (less elastic); short-haul competes with
+  //                    rail/car/rival hops (more elastic).
+  //   5. Competition — a contested route (low competitorPressure) gives
+  //                    passengers alternatives → more elastic; a route the
+  //                    airline owns outright → pricing power → less elastic.
+  const avgCityTier = (origin.tier + dest.tier) / 2; // 1 (global) .. 4 (small)
+  const cityTierFactor = clamp(0.80, 1.20, 0.70 + 0.12 * avgCityTier);
+
+  const elasticDoctrine = activeDoctrineId(team.doctrine);
+  const doctrineFactor =
+    elasticDoctrine === "premium-service"  ? 0.65 :
+    elasticDoctrine === "budget-expansion" ? 1.35 :
+    1.0; // global-network / cargo / connecting / none → middle
+
+  // Brand multiplier 0.40..1.80 → normalized 0..1 → tolerance 1.35..floor.
+  // A+ (m≥1.6 ⇒ brandNorm≈0.86) lands on the 0.06 floor → near-immune to
+  // fare hikes, exactly the "A+ loyalty can charge Ultra" intent.
+  const brandNorm = clamp(0, 1, (computeBrandMultiplier(team) - 0.40) / 1.40);
+  const brandToleranceFactor = clamp(0.06, 1.35, 1.35 - 1.50 * brandNorm);
+
+  const haulFactor = clamp(0.90, 1.12, 1.10 - (distanceKm - 1500) / 30000);
+
+  // competitorPressure: ~0.45 (fierce) .. ~1.15 (uncontested), computed
+  // above in the demand block. Invert into elasticity space.
+  const competitionFactor = clamp(0.85, 1.25, 1.0 + (1.0 - competitorPressure) * 0.60);
+
+  const elasticityContext =
+    cityTierFactor * doctrineFactor * brandToleranceFactor * haulFactor * competitionFactor;
+
+  // Per-cabin neutral baselines, scaled by the composite context and
+  // floored so the exponent can't invert (a fare hike must never raise
+  // demand) nor explode into an absurd cliff.
+  const ELASTICITY_ECON  = clamp(0.03, 3.50, 1.3 * elasticityContext);
+  const ELASTICITY_BUS   = clamp(0.03, 3.50, 0.6 * elasticityContext);
+  const ELASTICITY_FIRST = clamp(0.03, 3.50, 0.4 * elasticityContext);
 
   const dailyDemandFirst = effectiveDemand * shares.first *
     elasticityMult(chosenFirstBase, stdFirstBase, ELASTICITY_FIRST);
