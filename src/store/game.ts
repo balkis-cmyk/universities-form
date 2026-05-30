@@ -10344,7 +10344,14 @@ export function selectActiveTeam(s: GameStore): Team | null {
  *  are rivals from THIS browser's seat. Legacy `selectRivals`
  *  filtered on `!isPlayer` and worked only because exactly one
  *  team had isPlayer=true; in multiplayer every claimed seat is
- *  isPlayer-ish. */
+ *  isPlayer-ish.
+ *
+ *  ⚠️ Returns a NEW array each call (`.filter`). Do NOT pass this straight
+ *  into `useGame(selectOtherTeams)` — under Zustand v5's useSyncExternalStore
+ *  the fresh reference makes getSnapshot look changed every render and loops
+ *  to React #185 ("Maximum update depth exceeded"). Either wrap with
+ *  `useShallow`, or select `s.teams` + the active id and derive with useMemo
+ *  (see MarketIntelPanel). */
 export function selectOtherTeams(s: GameStore): Team[] {
   const meId = s.activeTeamId ?? s.playerTeamId;
   if (!meId) return s.teams;

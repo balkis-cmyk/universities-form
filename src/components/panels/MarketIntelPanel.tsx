@@ -4,7 +4,6 @@ import { useMemo, useState } from "react";
 import {
   useGame,
   selectActiveTeam,
-  selectOtherTeams,
   useCampaignStartYear,
 } from "@/store/game";
 import { AIRCRAFT_BY_ID } from "@/data/aircraft";
@@ -38,7 +37,6 @@ function manufacturerOf(specName: string): string {
 
 export function MarketIntelPanel() {
   const me = useGame(selectActiveTeam);
-  const others = useGame(selectOtherTeams);
   const teams = useGame((s) => s.teams);
   const preOrders = useGame((s) => s.preOrders);
   const productionCapOverrides = useGame((s) => s.productionCapOverrides);
@@ -47,6 +45,15 @@ export function MarketIntelPanel() {
   const startYear = useCampaignStartYear();
   const cmode: "half" | "full" = campaignMode === "full" ? "full" : "half";
   const myId = me?.id ?? null;
+
+  // Derive rivals from stable refs (teams + myId). Do NOT pull this from a
+  // store selector that returns `teams.filter(...)` — under Zustand v5's
+  // useSyncExternalStore a fresh array every render makes getSnapshot look
+  // perpetually changed and triggers an infinite re-render (React #185).
+  const others = useMemo(
+    () => teams.filter((t) => t.id !== myId),
+    [teams, myId],
+  );
 
   const [tab, setTab] = useState<IntelTab>("orderbook");
 
