@@ -67,6 +67,10 @@ export function RouteSetupModal({ open, origin, dest, forceCargo, onClose, onLau
   const [econFare, setEconFare] = useState<number | null>(null);
   const [busFare, setBusFare] = useState<number | null>(null);
   const [firstFare, setFirstFare] = useState<number | null>(null);
+  // Per-tonne cargo rate override (cargo routes only). null = engine
+  // default (distance- and tier-scaled base rate). Mirrors the passenger
+  // per-class fares so cargo gets the same explicit pricing control.
+  const [cargoRate, setCargoRate] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Inline slot-bid prices, keyed by airport code. Player sets these
   // when there's a shortfall; on Open route we submit them as auto-bids.
@@ -119,6 +123,7 @@ export function RouteSetupModal({ open, origin, dest, forceCargo, onClose, onLau
     setEconFare(null);
     setBusFare(null);
     setFirstFare(null);
+    setCargoRate(null);
     setError(null);
     // Clear stale bid prices when the route changes — bids are
     // airport-specific, and showing them carried over from a prior
@@ -506,6 +511,7 @@ export function RouteSetupModal({ open, origin, dest, forceCargo, onClose, onLau
       econFare,
       busFare,
       firstFare,
+      cargoRatePerTonne: isCargo ? cargoRate : null,
       isCargo,
       slotBids: slotBids.length > 0 ? slotBids : undefined,
     });
@@ -863,19 +869,70 @@ export function RouteSetupModal({ open, origin, dest, forceCargo, onClose, onLau
         {isCargo && (
           <Section
             step={3}
-            title="Cargo"
+            title="Cargo rate"
             disabled={!hasAircraft}
             help={
               "Cargo route economics:\n\n" +
               "• Daily demand = the lower of origin and destination business demand (in tonnes), adjusted by news cargo modifiers and your market-focus doctrine.\n\n" +
               "• Cost stack: airport slot fees (same auction system as passenger — cargo flights occupy slots) plus warehousing storage fees at both endpoints.\n\n" +
-              "• Rate per tonne scales by haul distance and Pricing Tier; you can override per route on the next step."
+              "• Rate per tonne scales by haul distance. Set the exact $/tonne fee below — higher rates earn more per tonne but suppress demand; lower rates fill capacity at thinner margins."
             }
           >
-            <div className="text-[0.8125rem] text-ink-2 italic">
-              Set frequency and pricing tier above. Slot bids on the next
-              step if you don&apos;t hold enough capacity at either airport.
-            </div>
+            {!hasAircraft ? (
+              <div className="text-[0.75rem] text-ink-muted italic">
+                Pick a freighter to set the cargo rate.
+              </div>
+            ) : (() => {
+              // Same range shape as the freighter rate slider in
+              // RouteDetailModal so the open-time and edit-time controls
+              // agree. Base rate scales by haul; default sits at the
+              // standard-tier base. The override bypasses tier scaling in
+              // the engine (route.cargoRatePerTonne ?? base × tierMult).
+              const baseRate = dist < 3000 ? 3.5 : 5.5;
+              const minRate = baseRate * 0.5;
+              const maxRate = baseRate * 3.0;
+              const effective = cargoRate ?? baseRate;
+              return (
+                <div className="rounded-md border border-line bg-surface-2/40 p-3 space-y-3">
+                  <div className="flex items-baseline justify-between text-[0.8125rem]">
+                    <span className="text-ink-2">
+                      Base ${baseRate.toFixed(2)}/T
+                      <span className="text-ink-muted"> · {dist < 3000 ? "short-haul" : "long-haul"}</span>
+                    </span>
+                    <span className="font-mono tabular text-ink font-semibold">
+                      ${effective.toFixed(2)}/T
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={minRate}
+                    max={maxRate}
+                    step={0.1}
+                    value={effective}
+                    onChange={(e) => setCargoRate(parseFloat(e.target.value))}
+                    className="w-full accent-primary block"
+                    aria-label="Cargo rate per tonne"
+                  />
+                  <div className="flex items-baseline justify-between text-[0.6875rem] text-ink-muted">
+                    <span>Min ${minRate.toFixed(2)}</span>
+                    {cargoRate !== null && (
+                      <button
+                        type="button"
+                        onClick={() => setCargoRate(null)}
+                        className="text-accent hover:underline"
+                      >
+                        Reset to base
+                      </button>
+                    )}
+                    <span>Max ${maxRate.toFixed(2)}</span>
+                  </div>
+                  <p className="text-[0.625rem] text-ink-muted leading-relaxed">
+                    Slot bids on the next step if you don&apos;t hold enough
+                    capacity at either airport.
+                  </p>
+                </div>
+              );
+            })()}
           </Section>
         )}
 

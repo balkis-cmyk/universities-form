@@ -49,7 +49,7 @@ import {
   loadSnapshot as snapLoad,
   deleteSnapshot as snapDelete,
 } from "@/lib/snapshots";
-import { FUEL_TANK_SPECS, FUEL_TANK_MAX_COUNT, operatedCities, effectiveBaseRatePct, effectiveRangeKm, effectiveTravelIndex, effectiveUnlockQuarter, newsFuelIndexHint, brokerResaleQuoteUsd, salvageQuoteUsd } from "@/lib/engine";
+import { FUEL_TANK_SPECS, FUEL_TANK_MAX_COUNT, operatedCities, effectiveBaseRatePct, effectiveRangeKm, effectiveTravelIndex, effectiveUnlockQuarter, newsFuelIndexHint, brokerResaleQuoteUsd, salvageQuoteUsd, classFareRangeForDoctrine } from "@/lib/engine";
 import {
   totalUpgradeCostPerPlaneUsd,
   amenityCostUsd,
@@ -551,6 +551,9 @@ export interface GameStore extends GameState {
     econFare?: number | null;
     busFare?: number | null;
     firstFare?: number | null;
+    /** Per-tonne cargo rate override (cargo routes only). null/undefined =
+     *  engine default (distance- and tier-scaled base rate). */
+    cargoRatePerTonne?: number | null;
     isCargo?: boolean;
     /** Optional auto-bids for slot shortfalls. Each entry submits a slot
      *  bid AT route-open time so the player doesn't have to leave the
@@ -583,6 +586,26 @@ export interface GameStore extends GameState {
      *  slots being bid for at that airport. */
     slotBidsByCode?: Record<string, number>;
   }): { ok: boolean; error?: string };
+
+  /** Bulk reprice every route in scope in one shot — the "Manage all"
+   *  control on the Routes panel. Two modes:
+   *    • "percent": nudge every effective fare (and cargo $/tonne) by
+   *      `percent` % (negative = drop rates, positive = raise), clamped
+   *      to each class's engine min/max. Resolves the current effective
+   *      fare first (override OR tier baseline) so the % is applied to
+   *      what the route actually charges today.
+   *    • "tier": snap every route to `tier` and clear all per-class /
+   *      cargo overrides so they align to that tier's baseline — the
+   *      "align to a threshold because the environment changed" case.
+   *  Pricing-only: does NOT touch aircraft, frequency, or slots, so it
+   *  skips the heavy updateRoute validation. Applies to non-closed
+   *  routes only. Returns how many routes were changed. */
+  bulkRepriceRoutes(args: {
+    scope: "all" | "passenger" | "cargo";
+    mode: "percent" | "tier";
+    percent?: number;
+    tier?: PricingTier;
+  }): { ok: boolean; count: number; error?: string };
 
   submitDecision(args: {
     scenarioId: string;
@@ -3400,7 +3423,7 @@ export const useGame = create<GameStore>()(
         else toast.info(toastTitle, toastDetail);
       },
 
-      openRoute: ({ originCode: rawOrigin, destCode: rawDest, aircraftIds, dailyFrequency, pricingTier, econFare, busFare, firstFare, isCargo, slotBids }) => {
+      openRoute: ({ originCode: rawOrigin, destCode: rawDest, aircraftIds, dailyFrequency, pricingTier, econFare, busFare, firstFare, cargoRatePerTonne, isCargo, slotBids }) => {
         if (get().isObserver) return { ok: false, error: "Observer mode — no edits allowed" };
         // Cargo routes require cargo-storage activation at both endpoints (PRD C9)
         const cargoStorageCost = (code: string): number => {
@@ -3798,7 +3821,7 @@ export const useGame = create<GameStore>()(
           econFare: econFare ?? null,
           busFare: busFare ?? null,
           firstFare: firstFare ?? null,
-          cargoRatePerTonne: null,
+          cargoRatePerTonne: cargoRatePerTonne ?? null,
           // Pending if we're awaiting auction resolution for slot shortfall;
           // active otherwise. Pending routes don't earn revenue this quarter
           // — they activate at next quarter-close once slots resolve.
@@ -4142,6 +4165,95 @@ export const useGame = create<GameStore>()(
         // but never landed on main. Audit reconfirmed in May 2026.
         void get().pushStateToServer("player.updatedRoute", { routeId });
         return { ok: true };
+      },
+
+      bulkRepriceRoutes: ({ scope, mode, percent, tier }) => {
+        const s = get();
+        const player = s.teams.find((t) => t.id === s.playerTeamId);
+        if (!player) return { ok: false, count: 0, error: "No player" };
+
+        if (mode === "percent") {
+          if (percent === undefined || !Number.isFinite(percent)) {
+            return { ok: false, count: 0, error: "No percentage given" };
+          }
+          if (percent === 0) {
+            return { ok: false, count: 0, error: "Pick a non-zero adjustment" };
+          }
+        }
+        if (mode === "tier" && !tier) {
+          return { ok: false, count: 0, error: "No tier given" };
+        }
+
+        const tierMultOf = (t: PricingTier) =>
+          t === "budget" ? 0.5 : t === "premium" ? 1.5 : t === "ultra" ? 2.0 : 1.0;
+        const factor = mode === "percent" ? 1 + (percent ?? 0) / 100 : 1;
+
+        const inScope = (r: Route) =>
+          r.status !== "closed" &&
+          (scope === "all" || (scope === "cargo" ? r.isCargo : !r.isCargo));
+
+        let count = 0;
+
+        const repriced = player.routes.map((r) => {
+          if (!inScope(r)) return r;
+          count++;
+
+          if (mode === "tier") {
+            // Align to the chosen tier and drop overrides so the route
+            // snaps cleanly to that tier's baseline pricing.
+            return {
+              ...r,
+              pricingTier: tier as PricingTier,
+              econFare: null,
+              busFare: null,
+              firstFare: null,
+              cargoRatePerTonne: null,
+            };
+          }
+
+          // percent mode — nudge each effective fare, then clamp.
+          if (r.isCargo) {
+            const baseRate = r.distanceKm < 3000 ? 3.5 : 5.5;
+            const minRate = baseRate * 0.5;
+            const maxRate = baseRate * 3.0;
+            const tierBase = baseRate * tierMultOf(r.pricingTier);
+            const effective = r.cargoRatePerTonne ?? tierBase;
+            const next = Math.min(maxRate, Math.max(minRate, effective * factor));
+            return {
+              ...r,
+              cargoRatePerTonne: Math.round(next * 100) / 100,
+            };
+          }
+
+          const econR = classFareRangeForDoctrine(r.distanceKm, "econ", player.doctrine);
+          const busR = classFareRangeForDoctrine(r.distanceKm, "bus", player.doctrine);
+          const firstR = classFareRangeForDoctrine(r.distanceKm, "first", player.doctrine);
+          const nudge = (
+            cur: number | null,
+            range: { min: number; base: number; max: number },
+          ) => {
+            const eff = cur ?? range.base;
+            return Math.round(Math.min(range.max, Math.max(range.min, eff * factor)));
+          };
+          return {
+            ...r,
+            econFare: nudge(r.econFare, econR),
+            busFare: nudge(r.busFare, busR),
+            firstFare: nudge(r.firstFare, firstR),
+          };
+        });
+
+        if (count === 0) {
+          return { ok: false, count: 0, error: "No routes in that scope" };
+        }
+
+        set({
+          teams: s.teams.map((t) =>
+            t.id !== player.id ? t : { ...t, routes: repriced },
+          ),
+        });
+        void get().pushStateToServer("player.bulkRepriced", { scope, mode });
+        return { ok: true, count };
       },
 
       submitDecision: ({ scenarioId, optionId, lockInQuarters }) => {

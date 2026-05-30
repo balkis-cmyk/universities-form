@@ -15,7 +15,7 @@ import {
   airlineColorFor,
   type AirlineColorId,
 } from "@/lib/games/airline-colors";
-import { AlertTriangle, ChevronRight, Pause, Play, Plus, X } from "lucide-react";
+import { AlertTriangle, ChevronRight, Pause, Play, Plus, SlidersHorizontal, X } from "lucide-react";
 import { RouteSetupModal, BidRow } from "@/components/game/RouteSetupModal";
 import { PanelSubheader } from "@/components/game/PanelSubheader";
 import { toast } from "@/store/toasts";
@@ -62,6 +62,11 @@ export function RoutesPanel() {
   const [pickerDest, setPickerDest] = useState<string | null>(null);
   const [setupOpen, setSetupOpen] = useState(false);
 
+  // "Manage all" bulk pricing — play-test ask (May 30): reprice the
+  // whole network at once when the environment shifts, instead of
+  // editing every route by hand.
+  const [manageAllOpen, setManageAllOpen] = useState(false);
+
   // Longest range any owned aircraft can fly (honouring engine
   // retrofits). Feeds the destination picker's "in range" indicator so
   // the player can see which cities their current fleet can actually
@@ -74,6 +79,28 @@ export function RoutesPanel() {
       return Math.max(max, effectiveRangeKm(spec, f.engineUpgrade ?? null));
     }, 0);
   }, [player]);
+
+  // Map of cities already connected to the picker's current origin →
+  // the existing route's id. Lets the destination picker (a) flag cities
+  // the player already flies to from this origin, and (b) open that
+  // route's detail instead of starting a duplicate new-route flow.
+  // Keyed by the OTHER endpoint so it works regardless of route direction
+  // (origin→dest or dest→origin). Non-closed routes only. Play-test ask
+  // (May 30): "show me which ones NY is already connected to … if i click
+  // one already connected it should show me the route, not as if its new".
+  const connectedFromPickerOrigin = useMemo(() => {
+    const m = new Map<string, string>();
+    if (!player || !pickerOrigin) return m;
+    for (const r of player.routes) {
+      if (r.status === "closed") continue;
+      if (r.originCode === pickerOrigin) {
+        if (!m.has(r.destCode)) m.set(r.destCode, r.id);
+      } else if (r.destCode === pickerOrigin) {
+        if (!m.has(r.originCode)) m.set(r.originCode, r.id);
+      }
+    }
+    return m;
+  }, [player, pickerOrigin]);
 
   // If GameCanvas asked us to focus a specific route (because the player
   // clicked an existing route's endpoints on the map), auto-open it once.
@@ -220,6 +247,16 @@ export function RoutesPanel() {
           <div className="text-[0.75rem] text-ink-muted tabular shrink-0">
             {rows.length} of {player.routes.filter((r) => r.status !== "closed").length}
           </div>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setManageAllOpen(true)}
+            className="shrink-0"
+            disabled={player.routes.filter((r) => r.status !== "closed").length === 0}
+            title="Reprice every route at once — drop rates by a % or align to a tier"
+          >
+            <SlidersHorizontal size={13} className="mr-1" /> Manage all
+          </Button>
           <Button
             variant="primary"
             size="sm"
@@ -588,6 +625,14 @@ export function RoutesPanel() {
               .flatMap((r) => [r.originCode, r.destCode]),
           ])
         }
+        connected={connectedFromPickerOrigin}
+        onOpenExisting={(routeId) => {
+          // Clicking an already-connected destination jumps straight to
+          // that route's detail rather than starting a duplicate route.
+          setPickerOpen(false);
+          setPickerDest(null);
+          setActiveRouteId(routeId);
+        }}
         maxFleetRangeKm={maxFleetRangeKm}
       />
 
@@ -602,7 +647,250 @@ export function RoutesPanel() {
           setPickerDest(null);
         }}
       />
+
+      {/* Bulk reprice — "Manage all" */}
+      <ManageAllModal
+        open={manageAllOpen}
+        passengerCount={player.routes.filter((r) => r.status !== "closed" && !r.isCargo).length}
+        cargoCount={player.routes.filter((r) => r.status !== "closed" && r.isCargo).length}
+        onClose={() => setManageAllOpen(false)}
+      />
     </div>
+  );
+}
+
+/**
+ * "Manage all" bulk-pricing modal. Two intents the playtest surfaced:
+ *   • "drop our rates by a certain percentage" → percent mode
+ *   • "align them to a certain threshold" → tier mode
+ * Scope toggles between all / passenger-only / cargo-only so the player
+ * can, e.g., discount only passenger routes during a fare war while
+ * leaving cargo rates untouched.
+ */
+function ManageAllModal({
+  open, passengerCount, cargoCount, onClose,
+}: {
+  open: boolean;
+  passengerCount: number;
+  cargoCount: number;
+  onClose: () => void;
+}) {
+  const bulkReprice = useGame((g) => g.bulkRepriceRoutes);
+  const [scope, setScope] = useState<"all" | "passenger" | "cargo">("all");
+  const [mode, setMode] = useState<"percent" | "tier">("percent");
+  const [percent, setPercent] = useState(-10);
+  const [tier, setTier] = useState<PricingTier>("standard");
+
+  // Reset to sensible defaults each time the modal opens.
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => {
+    if (open) {
+      setScope("all");
+      setMode("percent");
+      setPercent(-10);
+      setTier("standard");
+    }
+  }, [open]);
+  /* eslint-enable react-hooks/set-state-in-effect */
+
+  const scopeCount =
+    scope === "all" ? passengerCount + cargoCount
+      : scope === "passenger" ? passengerCount
+        : cargoCount;
+
+  const apply = () => {
+    const res = bulkReprice({
+      scope,
+      mode,
+      percent: mode === "percent" ? percent : undefined,
+      tier: mode === "tier" ? tier : undefined,
+    });
+    if (!res.ok) {
+      toast.negative("Couldn't reprice", res.error ?? "No routes changed.");
+      return;
+    }
+    const what =
+      mode === "percent"
+        ? `${percent > 0 ? "+" : ""}${percent}% on ${res.count} route${res.count === 1 ? "" : "s"}`
+        : `${res.count} route${res.count === 1 ? "" : "s"} → ${tier}`;
+    toast.success("Routes repriced", `Applied ${what}. Takes effect next quarter.`);
+    onClose();
+  };
+
+  return (
+    <Modal open={open} onClose={onClose}>
+      <ModalHeader>
+        <h2 className="font-display text-[1.5rem] text-ink flex items-center gap-2">
+          <SlidersHorizontal size={18} className="text-accent shrink-0" />
+          Manage all routes
+        </h2>
+        <p className="text-ink-muted text-[0.8125rem] mt-1">
+          Reprice the whole network at once instead of editing each route.
+          Changes apply at the next quarter close.
+        </p>
+      </ModalHeader>
+      <ModalBody>
+        <div className="space-y-5">
+          {/* Scope */}
+          <div>
+            <Label>Apply to</Label>
+            <div className="grid grid-cols-3 gap-2">
+              {([
+                { k: "all", label: "All routes", n: passengerCount + cargoCount },
+                { k: "passenger", label: "Passenger", n: passengerCount },
+                { k: "cargo", label: "Cargo", n: cargoCount },
+              ] as Array<{ k: typeof scope; label: string; n: number }>).map(({ k, label, n }) => (
+                <button
+                  key={k}
+                  onClick={() => setScope(k)}
+                  disabled={n === 0}
+                  className={cn(
+                    "rounded-md border px-3 py-2 transition-colors flex flex-col items-center gap-0.5",
+                    scope === k
+                      ? "border-accent bg-accent/[0.06] text-ink font-semibold"
+                      : "border-line text-ink-2 hover:bg-surface-hover",
+                    n === 0 && "opacity-40 cursor-not-allowed",
+                  )}
+                >
+                  <span className="text-[0.8125rem]">{label}</span>
+                  <span className="text-[0.625rem] tabular font-mono text-ink-muted">
+                    {n} route{n === 1 ? "" : "s"}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Mode */}
+          <div>
+            <Label>How</Label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setMode("percent")}
+                className={cn(
+                  "rounded-md border px-3 py-2 text-left transition-colors",
+                  mode === "percent"
+                    ? "border-accent bg-accent/[0.06] text-ink font-semibold"
+                    : "border-line text-ink-2 hover:bg-surface-hover",
+                )}
+              >
+                <span className="text-[0.8125rem]">Adjust by %</span>
+                <span className="block text-[0.625rem] text-ink-muted font-normal mt-0.5">
+                  Nudge today&apos;s fares up or down
+                </span>
+              </button>
+              <button
+                onClick={() => setMode("tier")}
+                className={cn(
+                  "rounded-md border px-3 py-2 text-left transition-colors",
+                  mode === "tier"
+                    ? "border-accent bg-accent/[0.06] text-ink font-semibold"
+                    : "border-line text-ink-2 hover:bg-surface-hover",
+                )}
+              >
+                <span className="text-[0.8125rem]">Align to tier</span>
+                <span className="block text-[0.625rem] text-ink-muted font-normal mt-0.5">
+                  Snap all to one pricing tier
+                </span>
+              </button>
+            </div>
+          </div>
+
+          {/* Mode controls */}
+          {mode === "percent" ? (
+            <div>
+              <Label>Adjustment</Label>
+              <div className="rounded-md border border-line bg-surface-2/40 p-3 space-y-3">
+                <div className="flex items-center gap-3">
+                  <input
+                    type="range"
+                    min={-50}
+                    max={50}
+                    step={1}
+                    value={percent}
+                    onChange={(e) => setPercent(parseInt(e.target.value, 10))}
+                    className="flex-1 accent-primary"
+                    aria-label="Fare adjustment percentage"
+                  />
+                  <span
+                    className={cn(
+                      "tabular font-mono font-semibold w-16 text-right",
+                      percent < 0 ? "text-negative" : percent > 0 ? "text-positive" : "text-ink",
+                    )}
+                  >
+                    {percent > 0 ? "+" : ""}{percent}%
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {[-20, -10, -5, 5, 10, 20].map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setPercent(p)}
+                      className={cn(
+                        "px-2 py-0.5 rounded-md border text-[0.75rem] tabular font-mono transition-colors",
+                        percent === p
+                          ? "border-accent bg-accent/[0.06] text-ink font-semibold"
+                          : "border-line text-ink-muted hover:bg-surface-hover",
+                      )}
+                    >
+                      {p > 0 ? "+" : ""}{p}%
+                    </button>
+                  ))}
+                </div>
+                <p className="text-[0.6875rem] text-ink-muted leading-relaxed">
+                  Applied to each route&apos;s current effective fare (and cargo
+                  $/tonne), then clamped to each cabin&apos;s allowed range.
+                  Routes already at a price floor or ceiling stop there.
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <Label>Target tier</Label>
+              <div className="grid grid-cols-4 gap-2">
+                {(["budget", "standard", "premium", "ultra"] as PricingTier[]).map((t) => {
+                  const mult = t === "budget" ? "0.5×"
+                    : t === "standard" ? "1.0×"
+                    : t === "premium" ? "1.5×" : "2.0×";
+                  return (
+                    <button
+                      key={t}
+                      onClick={() => setTier(t)}
+                      className={cn(
+                        "rounded-md border px-3 py-2 capitalize transition-colors flex flex-col items-center gap-0.5",
+                        tier === t
+                          ? "border-accent bg-accent/[0.06] text-ink font-semibold"
+                          : "border-line text-ink-2 hover:bg-surface-hover",
+                      )}
+                    >
+                      <span className="text-[0.8125rem]">{t}</span>
+                      <span className="text-[0.625rem] tabular font-mono text-ink-muted">
+                        {mult} base
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[0.6875rem] text-ink-muted leading-relaxed mt-2">
+                Snaps every route in scope to this tier and clears any
+                per-class or per-tonne overrides, so they all sit on the
+                tier baseline.
+              </p>
+            </div>
+          )}
+        </div>
+      </ModalBody>
+      <ModalFooter>
+        <Button variant="ghost" onClick={onClose}>Cancel</Button>
+        <Button
+          variant="primary"
+          onClick={apply}
+          disabled={scopeCount === 0 || (mode === "percent" && percent === 0)}
+        >
+          Apply to {scopeCount} route{scopeCount === 1 ? "" : "s"}
+        </Button>
+      </ModalFooter>
+    </Modal>
   );
 }
 
@@ -615,18 +903,25 @@ export function RoutesPanel() {
  * player most often needs.
  */
 function NewRoutePicker({
-  open, origin, dest, ownedCodes, maxFleetRangeKm,
-  onOriginChange, onDestChange, onCancel, onConfirm,
+  open, origin, dest, ownedCodes, connected, maxFleetRangeKm,
+  onOriginChange, onDestChange, onOpenExisting, onCancel, onConfirm,
 }: {
   open: boolean;
   origin: string | null;
   dest: string | null;
   ownedCodes: Set<string>;
+  /** city code → existing (non-closed) route id, for cities already
+   *  connected to the current origin. Drives the "Existing route" badge
+   *  and the open-instead-of-create interception below. */
+  connected: Map<string, string>;
   /** Longest range (km) any aircraft currently in the fleet can fly.
    *  Used to flag destinations no plane can reach from the chosen origin. */
   maxFleetRangeKm: number;
   onOriginChange: (code: string | null) => void;
   onDestChange: (code: string | null) => void;
+  /** Called when the player picks a destination they already fly to —
+   *  opens that route's detail rather than starting a new route. */
+  onOpenExisting: (routeId: string) => void;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -706,6 +1001,15 @@ function NewRoutePicker({
       }
     } else if (picking === "dest") {
       if (code === origin) return; // can't pick same as origin
+      // Already-connected destination → open that route's detail instead
+      // of starting a duplicate. The parent handles closing this picker.
+      const existingRouteId = connected.get(code);
+      if (existingRouteId) {
+        onOpenExisting(existingRouteId);
+        setPicking(null);
+        setSearch("");
+        return;
+      }
       onDestChange(code);
     }
     setPicking(null);
@@ -825,6 +1129,7 @@ function NewRoutePicker({
                       sortRef={sortRef}
                       origin={origin}
                       picking={picking}
+                      connected={connected}
                       maxFleetRangeKm={maxFleetRangeKm}
                       onPick={pick}
                     />
@@ -837,6 +1142,7 @@ function NewRoutePicker({
                       sortRef={sortRef}
                       origin={origin}
                       picking={picking}
+                      connected={connected}
                       maxFleetRangeKm={maxFleetRangeKm}
                       onPick={pick}
                     />
@@ -2483,13 +2789,15 @@ function TournamentBanner() {
  *  code, name, distance (when sorting by distance from origin), and
  *  a "Network" badge when in player's owned set. No tier label. */
 function RegionSection({
-  label, entries, sortRef, origin, picking, maxFleetRangeKm, onPick,
+  label, entries, sortRef, origin, picking, connected, maxFleetRangeKm, onPick,
 }: {
   label: string;
   entries: Array<{ city: import("@/types/game").City; distance: number }>;
   sortRef: string | null;
   origin: string | null;
   picking: "origin" | "dest" | null;
+  /** city code → existing route id for cities already connected to origin. */
+  connected: Map<string, string>;
   maxFleetRangeKm: number;
   onPick: (code: string) => void;
 }) {
@@ -2516,6 +2824,10 @@ function RegionSection({
           {entries.slice(0, 50).map(({ city: c, distance }) => {
             const country = countryForCode(c.code);
             const outOfRange = canFlagRange && distance > maxFleetRangeKm;
+            // Already-connected destinations get a teal "Existing route"
+            // badge; clicking opens that route rather than creating a new
+            // one. Only meaningful while picking a destination.
+            const isConnected = picking === "dest" && connected.has(c.code);
             return (
             <button
               key={c.code}
@@ -2525,6 +2837,7 @@ function RegionSection({
                 "w-full flex items-baseline gap-2 px-3 py-1.5 text-left text-[0.8125rem]",
                 "hover:bg-surface-hover transition-colors border-t border-line/40",
                 picking === "dest" && c.code === origin && "opacity-40 cursor-not-allowed",
+                isConnected && "bg-accent/[0.06]",
               )}
             >
               <span className="font-mono font-semibold text-ink shrink-0 w-10">
@@ -2538,7 +2851,12 @@ function RegionSection({
                   </span>
                 )}
               </span>
-              {outOfRange && (
+              {isConnected && (
+                <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-accent shrink-0">
+                  Existing route
+                </span>
+              )}
+              {outOfRange && !isConnected && (
                 <span className="text-[0.625rem] font-semibold uppercase tracking-wider text-negative shrink-0">
                   Out of range
                 </span>
