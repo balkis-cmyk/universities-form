@@ -1351,24 +1351,76 @@ export function baselineStaffCostUsd(team: Team): number {
   const secondaries = team.secondaryHubCodes?.length ?? 0;
   const hubBaseline = primaryHubCost + secondaryHubCost * secondaries;
 
-  // 2. Aircraft staffing — pilots + cabin + per-tail maintenance crew.
-  //    Tier-weighted: regional < narrow < wide < heavy-cargo.
-  //    Numbers are per-aircraft per-quarter. A 200-seat A320 carries
-  //    pilots, cabin crew, and dedicated mx techs — that runs in the
-  //    low millions per quarter at scale, not the $180K previously.
-  const aircraftBaseline = activeFleet.reduce((sum, f) => {
-    const spec = AIRCRAFT_BY_ID[f.specId];
-    if (!spec) return sum;
-    let factor: number;
+  // 2. Aircraft crew + maintenance-labour staffing — derived PER AIRCRAFT
+  //    TYPE from its real crew complement, with ECONOMIES OF SCALE across a
+  //    common-type fleet. Two parts:
+  //      • Per-flight crew (cockpit + cabin) — pilots and flight attendants
+  //        must staff every departure, so this is LINEAR in tail count: two
+  //        A380s genuinely need twice the pilots and cabin crew of one.
+  //      • Per-type fixed overhead (type-rating training program, spare-parts
+  //        inventory, fleet/maintenance management) — SHARED across the fleet
+  //        of that type, so each additional same-type tail adds only a small
+  //        increment. This is the synergy the prior flat `factor` model
+  //        missed: a 6-strong A350 fleet costs far less per tail to run than
+  //        a single orphan A350.
+  //    Crew complement is computed from the spec: cabin crew scale with the
+  //    seat mix (premium cabins are crew-heavy — 1 per 12 first / 24 business
+  //    / 50 economy, the real regulatory + service ratios), pilots step up
+  //    for long- and ultra-long-haul (augmented crews), and maintenance
+  //    technicians scale with airframe size. Salaries are fully loaded
+  //    (benefits, training, per-diems, management allocation).
+  // Fully-loaded quarterly cost per employed head: base pay + benefits +
+  // training + per-diems + the station/ground/admin staff each flying
+  // position carries (a full-service carrier employs ~300-400 people per
+  // widebody once gate, ramp, ops-control, dispatch and management are
+  // counted — far more than the cockpit + cabin alone). These rates roll
+  // that support headcount into the per-crew figure so total labour lands
+  // at a realistic ~16-20% of revenue rather than the ~10% the old flat
+  // factor produced.
+  const CREW_PILOT_Q = 150_000;  // per employed pilot (+ ops/dispatch support), per quarter
+  const CREW_CABIN_Q = 40_000;   // per employed cabin-crew member (+ gate/ground), per quarter
+  const CREW_MXTECH_Q = 52_000;  // per maintenance technician (+ engineering support), per quarter
+  const CREW_RATIO = 5;          // employed crew per per-flight position (rotations/rest/reserves/leave)
+  // Tally tails per type so scale economies can apply per type.
+  const tailsByType = new Map<string, number>();
+  for (const f of activeFleet) {
+    tailsByType.set(f.specId, (tailsByType.get(f.specId) ?? 0) + 1);
+  }
+  let aircraftBaseline = 0;
+  for (const [specId, count] of tailsByType) {
+    const spec = AIRCRAFT_BY_ID[specId];
+    if (!spec) continue;
+    let pilotsPerFlight: number;
+    let cabinPerFlight: number;
+    let mxTechsPerTail: number;
     if (spec.family === "cargo") {
       const t = spec.cargoTonnes ?? 0;
-      factor = t > 80 ? 1.3 : t > 40 ? 0.95 : 0.6;
+      pilotsPerFlight = spec.rangeKm >= 9000 ? 3 : 2;
+      cabinPerFlight = 1;                                   // loadmaster
+      mxTechsPerTail = Math.max(3, Math.round(t / 12));
     } else {
-      const seats = spec.seats.first + spec.seats.business + spec.seats.economy;
-      factor = seats < 100 ? 0.45 : seats < 250 ? 0.95 : 1.7;
+      const s = spec.seats;
+      cabinPerFlight = Math.max(
+        2,
+        Math.ceil(s.economy / 50 + s.business / 24 + s.first / 12),
+      );
+      pilotsPerFlight = spec.rangeKm >= 13000 ? 4 : spec.rangeKm >= 9000 ? 3 : 2;
+      const totalSeats = s.first + s.business + s.economy;
+      mxTechsPerTail = Math.max(3, Math.round(totalSeats / 40));
     }
-    return sum + 2_400_000 * factor;
-  }, 0);
+    const perTailCrewQ =
+      pilotsPerFlight * CREW_RATIO * CREW_PILOT_Q +
+      cabinPerFlight * CREW_RATIO * CREW_CABIN_Q +
+      mxTechsPerTail * CREW_MXTECH_Q;
+    // Per-type fixed overhead — sized to the airframe (a widebody training
+    // program + spares pool costs more than a narrowbody's).
+    const typeFixedQ = 1_300_000 + perTailCrewQ * 0.35;
+    // Economies of scale: the fixed overhead is mostly shared — each extra
+    // same-type tail adds only 18% more fixed cost. Per-flight crew (above)
+    // stays linear.
+    const scaledFixedQ = typeFixedQ * (1 + (count - 1) * 0.18);
+    aircraftBaseline += perTailCrewQ * count + scaledFixedQ;
+  }
 
   // 3. Route ops — passenger and cargo route managers, plus per-flight
   //    ground crew that scales with weekly schedule density.
@@ -2101,10 +2153,18 @@ export function computeRouteEconomics(
   // no such thing as anti-passengers. The upstream multiplier clamp
   // (computeRouteDemand) handles the common path; this catches any
   // future code that bypasses that helper.
+  // Subsidiary demand premium — every demand-side subsidiary the player
+  // owns at this route's endpoints lifts DEMAND (capped +25%). Earlier
+  // this multiplied final revenue directly (`quarterlyRevenue *= subMult`),
+  // which inflated takings even on a sold-out capacity-bound route where
+  // extra demand can't translate to extra seats. A demand-side bonus must
+  // lift demand and let the capacity clamp decide realized pax — exactly
+  // the "multipliers drive demand, not revenue" principle.
+  const subDemandMult = subsidiaryDemandMultiplier(team, route);
   const effectiveDemand = Math.max(
     0,
     demand.total * hubBonus * csMultiplier * loungeBonus * onboardingBonus *
-      doctrineDemandBonus * cabinPenalty,
+      doctrineDemandBonus * cabinPenalty * subDemandMult,
   );
 
   // ── Per-class OD pools (Wave 3.2) ──────────────────────
@@ -2274,9 +2334,42 @@ export function computeRouteEconomics(
   const dailyCapacityBus   = seatsPerFlight.bus   * route.dailyFrequency;
   const dailyCapacityEcon  = seatsPerFlight.econ  * route.dailyFrequency;
 
-  let dailyPaxFirst = Math.max(0, Math.min(dailyCapacityFirst, dailyDemandFirst));
-  let dailyPaxBus   = Math.max(0, Math.min(dailyCapacityBus,   dailyDemandBus));
-  let dailyPaxEcon  = Math.max(0, Math.min(dailyCapacityEcon,  dailyDemandEcon));
+  // ── Achievable load-factor ceiling by pricing tier (2026-05 rebalance) ──
+  // Pricing above the standard market fare EMPTIES seats even when raw
+  // demand exceeds capacity. On hot routes the OD demand pool is many
+  // times the cabin, so the demand-pool elasticity above never pulls
+  // realized demand below the seats — the route stays sold out and
+  // revenue scales linearly with the fare-tier multiplier (Ultra = 2×
+  // fare = 2× revenue, a pure printer that paid an A380 back in <1 year).
+  // Real carriers can't fill a cabin at 2× the going rate. This ceiling
+  // caps the SELLABLE fraction of each cabin as a function of how far
+  // above standard the player is pricing, so Ultra becomes a genuine
+  // yield-vs-load-factor tradeoff. Premium cabins are far less load-
+  // sensitive (corporate / last-minute pays); a strong brand and a
+  // premium-service doctrine lift the ceiling (people still fly you at a
+  // premium). Budget/Standard tiers are uncapped (ceiling 1.0).
+  //   tier multiplier: budget 0.5 · standard 1.0 · premium 1.5 · ultra 2.0
+  const loadCeil = (econBase: number, busBase: number, firstBase: number) => {
+    // brandNorm (0..1) and elasticDoctrine are computed above.
+    const brandLift = brandNorm * 0.16;
+    const doctrineLift = elasticDoctrine === "premium-service" ? 0.06 : 0;
+    return {
+      econ:  clamp(0.30, 1, econBase  + brandLift + doctrineLift),
+      bus:   clamp(0.30, 1, busBase   + brandLift + doctrineLift),
+      first: clamp(0.30, 1, firstBase + brandLift + doctrineLift),
+    };
+  };
+  const ceil =
+    tier >= 2.0 ? loadCeil(0.50, 0.58, 0.66) :   // Ultra
+    tier >= 1.5 ? loadCeil(0.72, 0.80, 0.84) :   // Premium
+    { econ: 1, bus: 1, first: 1 };               // Standard / Budget — uncapped
+  const sellableEcon  = dailyCapacityEcon  * ceil.econ;
+  const sellableBus   = dailyCapacityBus   * ceil.bus;
+  const sellableFirst = dailyCapacityFirst * ceil.first;
+
+  let dailyPaxFirst = Math.max(0, Math.min(sellableFirst, dailyDemandFirst));
+  let dailyPaxBus   = Math.max(0, Math.min(sellableBus,   dailyDemandBus));
+  let dailyPaxEcon  = Math.max(0, Math.min(sellableEcon,  dailyDemandEcon));
 
   // Tournament demand boost (PRD §10.3): the World Cup and Olympics each
   // have a single neutral host city chosen at game start (tier 1-2,
@@ -2381,15 +2474,13 @@ export function computeRouteEconomics(
   const quarterlyFirstPax = dailyPaxFirst * QUARTER_DAYS;
   const quarterlyBusPax   = dailyPaxBus   * QUARTER_DAYS;
   const quarterlyEconPax  = dailyPaxEcon  * QUARTER_DAYS;
-  // Subsidiary demand premium — every demand-side subsidiary the
-  // player owns at this route's endpoints lifts revenue (capped +25%).
-  // Calculated once here so per-class breakdowns stay proportional.
-  const subDemandMult = subsidiaryDemandMultiplier(team, route);
-  let quarterlyRevenue = (
+  // Subsidiary demand premium is applied to the DEMAND pool above
+  // (`effectiveDemand`), not here — so on a sold-out route it can't
+  // manufacture revenue beyond the seats actually available.
+  let quarterlyRevenue =
     quarterlyFirstPax * firstFare +
     quarterlyBusPax * busFare +
-    quarterlyEconPax * econFare
-  ) * subDemandMult;
+    quarterlyEconPax * econFare;
 
   // ─ Cargo-belly contribution on passenger flights ──────────
   // Players can fit a Standard or Expanded cargo belly on each
