@@ -76,9 +76,6 @@ import {
   AIRPORT_EXPANSION_SLOTS,
   AIRPORT_MAX_CAPACITY_BY_TIER,
   AIRPORT_UPGRADES_BY_QUARTER,
-  AIRPORT_AUCTION_WINDOW_QUARTERS,
-  AIRPORT_AUCTION_HARD_CAP_QUARTERS,
-  AIRPORT_MIN_RAISE_MULT,
   planConcessionRaise,
   airportAskingPriceUsd,
   applyGovernmentUpgrade,
@@ -2376,14 +2373,22 @@ export const useGame = create<GameStore>()(
           (a) => a.airportCode === airportCode && a.status === "open",
         );
 
-        // ── Path A: no live auction → OPEN one ──────────────────────────
+        // ── Path A: no pending purchase → PLACE one ─────────────────────
+        // Direct-buy model: a purchase completes at the very next quarter
+        // close (`closesQuarter = currentQuarter`, resolved before the
+        // quarter advances). The cash is escrowed now. The only way it
+        // doesn't complete is the rare case where a RIVAL places a higher
+        // competing offer that same quarter — then the higher offer wins
+        // and the loser is refunded (a brief sealed contest). The optional
+        // `bidPriceUsd` lets the player offer ABOVE asking up front to
+        // out-compete an expected rival.
         if (!liveAuction) {
           const askingPrice = airportAskingPriceUsd(airportCode, slotState, s.teams);
           const price = Math.max(askingPrice, Math.round(bidPriceUsd ?? askingPrice));
           if (player.cashUsd < price) {
             return {
               ok: false,
-              error: `Need ${fmtMoneyPlain(price)} cash to open the bidding (held in escrow while the auction runs)`,
+              error: `Need ${fmtMoneyPlain(price)} cash to buy ${city.name} (held in escrow until the purchase completes next quarter)`,
             };
           }
           const id = `cauc_${Math.random().toString(36).slice(2, 10)}`;
@@ -2391,7 +2396,8 @@ export const useGame = create<GameStore>()(
             id,
             airportCode,
             openedQuarter: s.currentQuarter,
-            closesQuarter: s.currentQuarter + AIRPORT_AUCTION_WINDOW_QUARTERS,
+            // Resolve at the next quarter close — own it next quarter.
+            closesQuarter: s.currentQuarter,
             reserveUsd: askingPrice,
             highBidTeamId: player.id,
             highBidUsd: price,
@@ -2401,78 +2407,29 @@ export const useGame = create<GameStore>()(
             ],
           };
           set({
-            // Escrow the opening bid immediately.
+            // Escrow the purchase price immediately.
             teams: s.teams.map((t) =>
               t.id === player.id ? { ...t, cashUsd: t.cashUsd - price } : t,
             ),
             airportConcessionAuctions: [...auctions, newAuction],
           });
+          const offeredOverAsking = price > askingPrice;
           toast.accent(
-            `Auction opened · ${city.name} (${airportCode})`,
-            `Your ${fmtMoneyPlain(price)} opening bid is the high bid and is held in escrow. Rival carriers can counter over the next ${AIRPORT_AUCTION_WINDOW_QUARTERS} quarters — watch the airport and raise if out-bid. Highest bidder when the window closes owns the airport.`,
+            `Purchase placed · ${city.name} (${airportCode})`,
+            `${fmtMoneyPlain(price)} is held in escrow. You'll take ownership at the next quarter close${offeredOverAsking ? "" : ""} — unless a rival carrier places a higher competing offer this quarter, in which case the higher offer wins and your cash is refunded. Track it under Investments → Airports.`,
           );
           return { ok: true, bidId: id };
         }
 
-        // ── Path B: live auction exists ─────────────────────────────────
-        // Already leading → nothing to do (can't bid against yourself).
-        if (liveAuction.highBidTeamId === player.id) {
-          return {
-            ok: false,
-            error: "You already hold the high bid on this airport. Wait for a rival to counter before raising.",
-          };
-        }
-
-        // RAISE — must beat the standing high bid by the min-raise margin.
-        const minRaise = Math.ceil(liveAuction.highBidUsd * AIRPORT_MIN_RAISE_MULT);
-        const price = Math.max(minRaise, Math.round(bidPriceUsd ?? minRaise));
-        if (price < minRaise) {
-          return {
-            ok: false,
-            error: `Your raise must be at least ${fmtMoneyPlain(minRaise)} (5% over the current high bid of ${fmtMoneyPlain(liveAuction.highBidUsd)}).`,
-          };
-        }
-        if (player.cashUsd < price) {
-          return {
-            ok: false,
-            error: `Need ${fmtMoneyPlain(price)} cash to raise (held in escrow while the auction runs)`,
-          };
-        }
-        const priorLeaderId = liveAuction.highBidTeamId;
-        const priorLeaderBid = liveAuction.highBidUsd;
-        // Anti-snipe: a late raise nudges the close out, bounded by the
-        // hard cap measured from the quarter the auction opened.
-        const newCloses = Math.min(
-          liveAuction.openedQuarter + AIRPORT_AUCTION_HARD_CAP_QUARTERS,
-          Math.max(liveAuction.closesQuarter, s.currentQuarter + 1),
-        );
-        set({
-          teams: s.teams.map((t) => {
-            if (t.id === player.id) return { ...t, cashUsd: t.cashUsd - price };
-            // Refund the prior leader's escrow — they're no longer holding.
-            if (t.id === priorLeaderId) return { ...t, cashUsd: t.cashUsd + priorLeaderBid };
-            return t;
-          }),
-          airportConcessionAuctions: auctions.map((a) =>
-            a.id === liveAuction.id
-              ? {
-                  ...a,
-                  highBidTeamId: player.id,
-                  highBidUsd: price,
-                  closesQuarter: newCloses,
-                  history: [
-                    ...a.history,
-                    { teamId: player.id, amountUsd: price, quarter: s.currentQuarter, kind: "raise" as const },
-                  ],
-                }
-              : a,
-          ),
-        });
-        toast.accent(
-          `Raised to ${fmtMoneyPlain(price)} · ${city.name} (${airportCode})`,
-          `You're back in the lead. ${fmtMoneyPlain(price)} is held in escrow. The auction closes ${newCloses === s.currentQuarter + 1 ? "next quarter" : `in ${newCloses - s.currentQuarter} quarters`} unless out-bid again.`,
-        );
-        return { ok: true, bidId: liveAuction.id };
+        // ── Path B: a purchase is already pending on this airport ───────
+        // In the direct-buy model a rival never opens its own auction (bots
+        // only place a competing offer at quarter close, which also resolves
+        // it the same close). So a live entry here is always the player's own
+        // pending purchase — there's nothing to raise; it simply completes.
+        return {
+          ok: false,
+          error: `You already have a purchase pending on ${city.name} — it completes at the next quarter close. Track it under Investments → Airports.`,
+        };
       },
 
       approveAirportBid: (bidId) => {
@@ -4967,8 +4924,8 @@ export const useGame = create<GameStore>()(
               });
               if (liveAuction.highBidTeamId === sNow.playerTeamId) {
                 toast.warning(
-                  `Auction void · ${city?.name ?? liveAuction.airportCode}`,
-                  `${city?.name ?? liveAuction.airportCode} was acquired through another route — your ${fmtMoneyPlain(liveAuction.highBidUsd)} escrow has been refunded.`,
+                  `Purchase refunded · ${city?.name ?? liveAuction.airportCode}`,
+                  `${city?.name ?? liveAuction.airportCode} was acquired through another route — your ${fmtMoneyPlain(liveAuction.highBidUsd)} has been refunded in full.`,
                 );
               }
               continue;
@@ -5020,7 +4977,7 @@ export const useGame = create<GameStore>()(
               if (wasPlayerLeading) {
                 toast.warning(
                   `Out-bid · ${city?.name ?? liveAuction.airportCode}`,
-                  `${rivalTeam?.name ?? "A rival carrier"} raised to ${fmtMoneyPlain(raise.amountUsd)} for the ${city?.name ?? liveAuction.airportCode} concession — your ${fmtMoneyPlain(priorLeaderBid)} escrow has been refunded. Bid again higher to stay in the auction before it closes.`,
+                  `${rivalTeam?.name ?? "A rival carrier"} placed a higher competing offer (${fmtMoneyPlain(raise.amountUsd)}) for ${city?.name ?? liveAuction.airportCode} this quarter and won it — your ${fmtMoneyPlain(priorLeaderBid)} has been refunded in full. To beat a rival next time, offer above the asking price up front.`,
                 );
               }
             }
@@ -5073,7 +5030,7 @@ export const useGame = create<GameStore>()(
             if (cur.highBidTeamId === sAfter.playerTeamId) {
               toast.success(
                 `Airport acquired · ${city?.name ?? cur.airportCode}`,
-                `You won the ${city?.name ?? cur.airportCode} concession with a ${fmtMoneyPlain(cur.highBidUsd)} high bid. You now own the airport — slot fees flow to you from next quarter, and it's no longer open for bidding.`,
+                `Your ${fmtMoneyPlain(cur.highBidUsd)} purchase of ${city?.name ?? cur.airportCode} completed. You now own the airport — every airline's slot fees here flow to you from next quarter, and you can set the slot rate and fund expansions under Investments → Airports.`,
               );
             } else {
               toast.info(

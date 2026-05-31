@@ -8,7 +8,6 @@ import { useGame, selectPlayer, useCampaignStartYear } from "@/store/game";
 import { AdminPanel } from "@/components/panels/AdminPanel";
 import { fmtMoney, fmtQuarter } from "@/lib/format";
 import { computeAirlineValue, brandRating, fleetCount } from "@/lib/engine";
-import { AIRPORT_AUCTION_WINDOW_QUARTERS } from "@/lib/airport-ownership";
 import { cn } from "@/lib/cn";
 import { ArrowLeft, Plane, Users, Settings2, Trophy, Key, Mic, Save, Download, Upload, RotateCcw, Trash2, Lock, Unlock, Building, Check, X, Loader2, AlertCircle } from "lucide-react";
 import { CITIES } from "@/data/cities";
@@ -1140,28 +1139,27 @@ function AirportsView() {
   return (
     <div className="space-y-6 max-w-4xl">
       <header>
-        <h1 className="font-display text-[1.75rem] text-ink mb-1">Airports · concessions</h1>
+        <h1 className="font-display text-[1.75rem] text-ink mb-1">Airports · acquisitions</h1>
         <p className="text-ink-2 text-[0.9375rem] leading-relaxed">
-          Airports go to the highest bidder in a live ascending auction.
-          When a team opens the bidding, a {AIRPORT_AUCTION_WINDOW_QUARTERS}-quarter
-          window starts; rival airlines can counter and teams can raise. At
-          window close the standing high bidder wins and takes operating
-          control automatically — no decision needed from you. This page is a
-          read-only monitor so you can narrate the bidding war in the room.
+          Teams buy airports directly: a purchase placed this quarter completes
+          at the next quarter close. In the rare case two teams bid on the same
+          airport the same quarter, the higher offer wins and the loser is
+          refunded. Ownership transfers automatically — no decision needed from
+          you. This page is a read-only monitor of pending purchases.
         </p>
       </header>
 
-      {/* Live auctions monitor — the current player-facing acquisition flow. */}
+      {/* Pending purchases monitor — the current player-facing acquisition flow. */}
       <section>
         <div className="text-[0.6875rem] uppercase tracking-wider text-ink-muted font-semibold mb-2">
-          Live concession auctions · {liveAuctions.length}
+          Pending airport purchases · {liveAuctions.length}
         </div>
         {liveAuctions.length === 0 ? (
           <Card>
             <CardBody>
               <p className="text-[0.875rem] text-ink-muted italic">
-                No auctions running. When a team opens bidding on an airport it
-                will appear here with the standing high bid and closing quarter.
+                No pending purchases. When a team buys an airport it will appear
+                here with the offer and the quarter it completes.
               </p>
             </CardBody>
           </Card>

@@ -181,7 +181,12 @@ export function planConcessionRaise(opts: {
   const tier = (CITIES_BY_CODE[opts.airportCode]?.tier ?? 4) as 1 | 2 | 3 | 4;
   // How far over the reserve the standing bid already sits (1 = at reserve).
   const overReserve = opts.reserveUsd > 0 ? opts.highBidUsd / opts.reserveUsd : 1;
-  const baseAppetite = tier === 1 ? 0.55 : tier === 2 ? 0.4 : tier === 3 ? 0.22 : 0.1;
+  // Direct-buy model (2026-05): buying an airport should USUALLY just
+  // complete — a rival only occasionally contests a marquee gateway the
+  // same quarter. These appetites are intentionally low so the player
+  // experiences "click Buy → own it next quarter" the vast majority of
+  // the time, with the sealed contest as the rare, dramatic exception.
+  const baseAppetite = tier === 1 ? 0.22 : tier === 2 ? 0.13 : tier === 3 ? 0.07 : 0.03;
   // Appetite decays the further the bid has run past the reserve.
   const appetite = Math.max(0, baseAppetite * Math.max(0, 1 - (overReserve - 1) * 1.1));
   if (rng() >= appetite) return null;

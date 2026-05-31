@@ -1145,14 +1145,12 @@ function PortfolioOverview() {
           ctaLabel={ownedAirports.length > 0 ? "Open first" : undefined}
         />
         <PortfolioCount
-          label="Live auctions"
+          label="Pending buys"
           value={myAuctions.length}
           sub={
             myAuctions.length === 0
-              ? "No active bids"
-              : outbidAuctions.length > 0
-                ? `${outbidAuctions.length} out-bid · raise to stay in`
-                : `${fmtMoney(escrowedBidsUsd)} leading in escrow`
+              ? "No pending purchases"
+              : `${fmtMoney(escrowedBidsUsd)} in escrow · completes next quarter`
           }
           onClick={myAuctions.length > 0 ? () => setAirportDetailCode(myAuctions[0].auction.airportCode) : undefined}
           ctaLabel={myAuctions.length > 0 ? "Open first" : undefined}
@@ -1207,17 +1205,16 @@ function PortfolioOverview() {
         </div>
       )}
 
-      {/* Live concession auctions detail list */}
+      {/* Pending airport purchases detail list */}
       {myAuctions.length > 0 && (
         <div className="mt-3">
           <div className="text-[0.625rem] uppercase tracking-wider text-ink-muted mb-1.5">
-            Live concession auctions · you have bid
+            Pending airport purchases
           </div>
           <div className="space-y-1.5">
-            {myAuctions.map(({ auction: a, leading, closesIn }) => {
+            {myAuctions.map(({ auction: a, leading }) => {
               const city = CITIES_BY_CODE[a.airportCode];
-              const closesLabel =
-                closesIn <= 0 ? "closes this Q" : closesIn === 1 ? "closes next Q" : `closes in ${closesIn}Q`;
+              const closesLabel = "completes next Q";
               return (
                 <button
                   key={a.id}
@@ -1239,7 +1236,7 @@ function PortfolioOverview() {
                         leading ? "text-accent" : "text-warning",
                       )}
                     >
-                      {leading ? "you lead" : "out-bid"} · {closesLabel}
+                      {leading ? "buying" : "out-bid"} · {closesLabel}
                     </span>
                   </span>
                   <span className="text-[0.75rem] tabular font-mono text-ink shrink-0">
