@@ -209,6 +209,49 @@ export function planConcessionRaise(opts: {
   return { teamId: chosen.id, amountUsd: target };
 }
 
+/** Per-tier ceiling base for an owner-set weekly slot rate — roughly 4× the
+ *  competitive auction base. The real ceiling scales UP from here. */
+export const OWNER_SLOT_RATE_BASE_BY_TIER: Record<1 | 2 | 3 | 4, number> = {
+  1: 20_000,
+  2: 12_000,
+  3: 6_000,
+  4: 3_000,
+};
+
+/** Maximum weekly slot rate the airport's owner may charge each tenant.
+ *  The ceiling GROWS with three things (per the design brief):
+ *    1. Airport tier — a Tier-1 mega-hub commands far more than a Tier-4 strip.
+ *    2. Travellers to the destination — busier airports can charge higher
+ *       gate fees (city business + tourism demand).
+ *    3. The owner's leveled-up on-airport investments — duty-free, premium
+ *       lounge, hotel, chauffeur, etc. (subsidiaries at this city, weighted
+ *       basic/premium/flagship, plus a premium-lounge hub investment).
+ *  This kills the "set $10M/slot and bankrupt every rival" exploit while
+ *  making genuine investment the lever that raises your pricing power. */
+export function maxOwnerSlotRatePerWeekUsd(
+  airportCode: string,
+  ownerTeam: Team,
+): number {
+  const city = CITIES_BY_CODE[airportCode];
+  if (!city) return OWNER_SLOT_RATE_BASE_BY_TIER[4];
+  const tier = (city.tier ?? 4) as 1 | 2 | 3 | 4;
+  const base = OWNER_SLOT_RATE_BASE_BY_TIER[tier];
+  // Travellers: daily business + tourism demand. ~2,000 is a mid hub; a
+  // 6,000+ gateway lifts the ceiling by up to +150%.
+  const travellers = (city.business ?? 0) + (city.tourism ?? 0);
+  const travellerMult = 1 + Math.min(1.5, travellers / 4_000);
+  // Investments at this city: subsidiaries (basic 1 / premium 2 / flagship 3)
+  // plus a premium-lounge hub. Each point ≈ +20%, capped at +150%.
+  let invScore = 0;
+  for (const sub of ownerTeam.subsidiaries ?? []) {
+    if (sub.cityCode !== airportCode) continue;
+    invScore += sub.tier === "flagship" ? 3 : sub.tier === "premium" ? 2 : 1;
+  }
+  if (ownerTeam.hubInvestments?.premiumLoungeHubs?.includes(airportCode)) invScore += 2;
+  const investmentMult = 1 + Math.min(1.5, invScore * 0.2);
+  return Math.round(base * travellerMult * investmentMult);
+}
+
 /** Quarterly slot revenue the airport's owner collects this round —
  *  exactly the team-side slot fee total, but credited to the owner. */
 export function airportQuarterlySlotRevenueUsd(

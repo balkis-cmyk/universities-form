@@ -17,6 +17,7 @@ import {
   AIRPORT_EXPANSION_COST_PER_LEVEL,
   AIRPORT_EXPANSION_SLOTS,
   AIRPORT_MAX_CAPACITY_BY_TIER,
+  maxOwnerSlotRatePerWeekUsd,
 } from "@/lib/airport-ownership";
 import { cityEffectiveDemand } from "@/lib/engine";
 import { cityEventImpact } from "@/lib/city-events";
@@ -574,46 +575,61 @@ function AirportOwnership({ cityCode }: { cityCode: string }) {
             <div className="text-[0.6875rem] uppercase tracking-wider text-ink-muted mb-1.5">
               Change slot rate
             </div>
-            <div className="flex items-center gap-2">
-              <div className="flex-1 relative">
-                <span className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-muted text-[0.875rem] pointer-events-none">$</span>
-                <input
-                  type="text"
-                  inputMode="numeric"
-                  placeholder={currentRate.toLocaleString()}
-                  value={pendingRate}
-                  onChange={(e) => {
-                    // Strip any commas the user types so we can re-format
-                    // and keep the underlying number clean for parseInt.
-                    const digits = e.target.value.replace(/[^\d]/g, "");
-                    setPendingRate(
-                      digits === "" ? "" : parseInt(digits, 10).toLocaleString(),
-                    );
-                  }}
-                  className="w-full rounded-md border border-line bg-surface pl-6 pr-2.5 py-1.5 text-[0.875rem] tabular font-mono"
-                />
-              </div>
-              <Button
-                size="sm"
-                variant="primary"
-                disabled={!pendingRate}
-                onClick={() => {
-                  // Strip commas before parsing.
-                  const v = parseInt(pendingRate.replace(/,/g, ""), 10);
-                  if (Number.isNaN(v)) return;
-                  setAirportSlotRate({ airportCode: cityCode, newRatePerWeekUsd: v });
-                  setPendingRate("");
-                }}
-              >
-                Apply rate
-              </Button>
-            </div>
-            <div className="text-[0.6875rem] text-ink-muted mt-1">
-              Higher rates extract more revenue but may price tenants out
-              (they can release slots if your fee outweighs the route).
-              All current tenants are re-billed at the new rate from
-              next quarter.
-            </div>
+            {(() => {
+              // The owner rate is capped so it can't be weaponised to bankrupt
+              // rivals. The ceiling grows with airport tier, destination
+              // travellers, and the owner's on-airport investments (lounge,
+              // duty-free, hotel, chauffeur — subsidiaries here).
+              const maxRate = maxOwnerSlotRatePerWeekUsd(cityCode, player);
+              const draftNum = pendingRate ? parseInt(pendingRate.replace(/[^\d]/g, ""), 10) : NaN;
+              const sliderVal = Math.min(
+                maxRate,
+                Math.max(1_000, Number.isNaN(draftNum) ? (currentRate || 1_000) : draftNum),
+              );
+              return (
+                <>
+                  <div className="flex items-baseline justify-between mb-1.5">
+                    <span className="tabular font-mono text-ink text-[1.0625rem] font-bold">
+                      {fmtMoney(sliderVal)}
+                      <span className="text-ink-muted text-[0.75rem] font-normal"> /wk · slot</span>
+                    </span>
+                    <span className="text-[0.6875rem] text-ink-muted">
+                      ceiling {fmtMoney(maxRate)}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={1_000}
+                    max={maxRate}
+                    step={500}
+                    value={sliderVal}
+                    onChange={(e) => setPendingRate(String(parseInt(e.target.value, 10)))}
+                    className="w-full accent-[var(--accent)] cursor-pointer"
+                    aria-label="Owner slot rate per week"
+                  />
+                  <div className="flex items-end justify-between gap-3 mt-1.5">
+                    <span className="text-[0.6875rem] text-ink-muted leading-snug flex-1">
+                      Invest in lounges, duty-free and hotels here — and serve busier
+                      destinations — to lift the ceiling. Tenants are re-billed next
+                      quarter and may release slots if your fee outweighs their route.
+                    </span>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={!pendingRate}
+                      onClick={() => {
+                        const v = parseInt(pendingRate.replace(/[^\d]/g, ""), 10);
+                        if (Number.isNaN(v)) return;
+                        setAirportSlotRate({ airportCode: cityCode, newRatePerWeekUsd: v });
+                        setPendingRate("");
+                      }}
+                    >
+                      Apply
+                    </Button>
+                  </div>
+                </>
+              );
+            })()}
           </div>
 
           <div>

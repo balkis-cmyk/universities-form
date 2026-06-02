@@ -81,6 +81,7 @@ import {
   airportAskingPriceUsd,
   applyGovernmentUpgrade,
   applyOwnerSlotRate,
+  maxOwnerSlotRatePerWeekUsd,
   type AirportGovernmentUpgrade,
 } from "@/lib/airport-ownership";
 import {
@@ -2733,7 +2734,13 @@ export const useGame = create<GameStore>()(
         if (!slotState?.ownerTeamId || slotState.ownerTeamId !== player.id) {
           return { ok: false, error: "You don't own this airport" };
         }
-        const rate = Math.max(1_000, Math.round(newRatePerWeekUsd));
+        // Cap the rate so a player can't set an abusive $10M/slot fee to
+        // bankrupt rivals. The ceiling grows with airport tier, destination
+        // travellers, and the owner's on-airport investments (lounge/duty-
+        // free/hotel/subsidiaries) — invest more to charge more.
+        const maxRate = maxOwnerSlotRatePerWeekUsd(airportCode, player);
+        const requested = Math.max(1_000, Math.round(newRatePerWeekUsd));
+        const rate = Math.min(maxRate, requested);
         const teams = applyOwnerSlotRate(s.teams, airportCode, rate);
         set({
           teams,
@@ -2745,7 +2752,9 @@ export const useGame = create<GameStore>()(
         const city = CITIES_BY_CODE[airportCode];
         toast.accent(
           `Slot rate updated · ${city?.name ?? airportCode}`,
-          `New rate ${fmtMoneyPlain(rate)}/wk per slot. Tenants charged from next quarter.`,
+          requested > maxRate
+            ? `Capped at ${fmtMoneyPlain(rate)}/wk per slot (the most this airport can command). Raise the ceiling by serving busier destinations and investing in lounges, duty-free, and hotels here.`
+            : `New rate ${fmtMoneyPlain(rate)}/wk per slot. Tenants charged from next quarter.`,
         );
         return { ok: true };
       },
@@ -6503,7 +6512,21 @@ export const useGame = create<GameStore>()(
           const realCosts = realRouteFuel + realRouteSlots + leaseAndMaintenance;
           const proceduralCosts = proceduralRevenue * (1 - adjustedMargin) + fuelDrag;
           const blendedCosts = realCosts * realWeight + proceduralCosts * (1 - realWeight);
-          const netProfit = blendedRevenue - blendedCosts;
+
+          // ── Airport slot fees (team-level) — bots NOW pay them ──────────
+          // Slot fees are charged at the team level (Σ leases × 13 weeks),
+          // not per-route, so the procedural/real route blend above never
+          // included them — which is why a player who owned an airport and
+          // jacked the slot rate saw rivals shrug it off. Charge the bot the
+          // same fee the player collects: every lease's weekly cost (which
+          // already carries any owner-set rate via applyOwnerSlotRate) × 13.
+          // An airport the bot itself owns nets to ~0 (it pays itself); a
+          // player-owned airport really bleeds the bot's cash.
+          let botSlotFees = 0;
+          for (const lease of Object.values(r.airportLeases ?? {})) {
+            botSlotFees += (lease?.totalWeeklyCost ?? 0) * 13;
+          }
+          const netProfit = blendedRevenue - blendedCosts - botSlotFees;
 
           // Brand drift — successful rivals build brand, losing rivals erode it
           const driftBrand = netProfit > 0 ? 1 + Math.random() * 1.5 : -1 - Math.random();
@@ -6511,7 +6534,10 @@ export const useGame = create<GameStore>()(
 
           const newBrand = Math.max(0, Math.min(100, r.brandPts + driftBrand));
           const newLoyalty = Math.max(0, Math.min(100, r.customerLoyaltyPct + driftLoyalty));
-          const newCash = Math.max(0, r.cashUsd + netProfit);
+          // Full realism (user choice): no cash floor. A bot that can't cover
+          // its costs — including a rival's punishing slot fees — goes into
+          // the red and can fail, exactly like the player.
+          const newCash = r.cashUsd + netProfit;
 
           const updated: Team = {
             ...r,
@@ -6529,7 +6555,7 @@ export const useGame = create<GameStore>()(
                 cash: newCash,
                 debt: r.totalDebtUsd,
                 revenue: blendedRevenue,
-                costs: blendedCosts,
+                costs: blendedCosts + botSlotFees,
                 netProfit,
                 brandPts: newBrand,
                 opsPts: r.opsPts,
