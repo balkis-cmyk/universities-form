@@ -1028,7 +1028,8 @@ async function submitForm(e) {
   // Collect all form data
   const fd = new FormData(document.getElementById('form'));
   // Formspree endpoint — replace YOUR_FORM_ID with actual ID from formspree.io
-  const FORMSPREE_ENDPOINT = 'https://api.web3forms.com/submit';
+  const WEB3FORMS_ENDPOINT = 'https://api.web3forms.com/submit';
+  const SHEETS_ENDPOINT = 'https://script.google.com/macros/s/AKfycbzKGMOVpalc3VBeHWQQ9R-zNh5mm9M9gPm1zZXI3QqlJSYEgtx9UTBUnWhHi1RwniZl/exec';
 
   // Save to localStorage regardless of network result
   const snapshot = {};
@@ -1039,11 +1040,20 @@ async function submitForm(e) {
   localStorage.setItem('ican_submissions', JSON.stringify(stored));
 
   try {
-    const res = await fetch(FORMSPREE_ENDPOINT, {
-      method: 'POST',
-      body: fd,
-      headers: { 'Accept': 'application/json' }
-    });
+    // Send to Web3Forms (email) and Google Sheets in parallel
+    const [res] = await Promise.all([
+      fetch(WEB3FORMS_ENDPOINT, {
+        method: 'POST',
+        body: fd,
+        headers: { 'Accept': 'application/json' }
+      }),
+      fetch(SHEETS_ENDPOINT, {
+        method: 'POST',
+        body: JSON.stringify(snapshot),
+        headers: { 'Content-Type': 'text/plain' }
+      }).catch(() => {}) // sheets failure is silent — email still works
+    ]);
+
     if (res.ok) {
       document.getElementById('modal').classList.add('show');
     } else {
