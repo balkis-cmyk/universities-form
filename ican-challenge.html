@@ -711,9 +711,10 @@ footer { background: var(--dark); padding: 28px 60px; display: flex; align-items
 
   <div class="container">
     <div class="form-area">
-      <form id="form" onsubmit="submitForm(event)" novalidate name="ican-registration" netlify netlify-honeypot="bot-field" data-netlify="true">
-        <input type="hidden" name="form-name" value="ican-registration">
-        <p style="display:none"><label>Don't fill this out: <input name="bot-field"></label></p>
+      <form id="form" onsubmit="submitForm(event)" novalidate>
+        <input type="hidden" name="access_key" value="YOUR_WEB3FORMS_ACCESS_KEY">
+        <input type="hidden" name="subject" value="ICAN UAE 2026 — New Team Registration">
+        <input type="hidden" name="from_name" value="ICAN Registration Form">
 
         <!-- UNIVERSITY -->
         <div class="form-block reveal">
@@ -1027,7 +1028,7 @@ async function submitForm(e) {
   // Collect all form data
   const fd = new FormData(document.getElementById('form'));
   // Formspree endpoint — replace YOUR_FORM_ID with actual ID from formspree.io
-  const FORMSPREE_ENDPOINT = '/';
+  const FORMSPREE_ENDPOINT = 'https://api.web3forms.com/submit';
 
   // Save to localStorage regardless of network result
   const snapshot = {};
